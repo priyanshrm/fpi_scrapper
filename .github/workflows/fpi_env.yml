@@ -165,11 +165,14 @@ jobs:
           python merge_fpi_dbs.py \
             ${{ needs.calculate-chunks.outputs.start_year }} \
             ${{ needs.calculate-chunks.outputs.end_year }}
-
+            
       - name: Show final output
         run: |
-          echo "Final database:"
+          echo "Files in workspace:"
+          ls -lh *.db 2>/dev/null || echo "No .db files"
           ls -lh *_FINAL_*.db 2>/dev/null || echo "No FINAL DB found"
+          echo "---"
+          find . -name "*.db" -type f 2>/dev/null || echo "No DB files anywhere"
 
       - name: Upload final DB as artifact
         uses: actions/upload-artifact@v4
@@ -183,10 +186,14 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          if ls *_FINAL_*.db 1> /dev/null 2>&1; then
-            git add *_FINAL_*.db
+          FINAL_DB=$(ls *_FINAL_*.db 2>/dev/null | head -1)
+          
+          if [ -n "$FINAL_DB" ]; then
+            echo "Found final DB: $FINAL_DB"
+            git add "$FINAL_DB"
             git commit -m "Auto-updated FPI daily data [skip ci]" || echo "No changes to commit"
             git push
           else
-            echo "No FINAL DB to commit"
+            echo "No FINAL DB found to commit"
+            ls -lh *.db 2>/dev/null
           fi
