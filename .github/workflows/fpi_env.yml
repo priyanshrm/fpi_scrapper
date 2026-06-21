@@ -1,0 +1,10 @@
+name: fpi-scraper
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - selenium==4.15.2
+    - webdriver-manager==4.0.1
