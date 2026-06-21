@@ -28,14 +28,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Verify file exists
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Files in workspace:"
-          ls -la
-          echo "Looking for fpi_scraper.py..."
-          find . -name "fpi_scraper.py" -type f || echo "WARNING: fpi_scraper.py not found!"
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -61,31 +53,10 @@ jobs:
           END_YEAR: ${{ github.event.inputs.end_year || '2025' }}
           USE_LAST_DAY: ${{ github.event.inputs.use_last_day || 'True' }}
         run: |
-          # Check if file exists and run it
-          if [ -f "fpi_scraper.py" ]; then
-            echo "Found fpi_scraper.py, running..."
-            python fpi_scraper.py \
-              --start-year $START_YEAR \
-              --end-year $END_YEAR \
-              --use-last-day $USE_LAST_DAY
-          elif [ -f "scraper.py" ]; then
-            echo "Found scraper.py, running..."
-            python scraper.py \
-              --start-year $START_YEAR \
-              --end-year $END_YEAR \
-              --use-last-day $USE_LAST_DAY
-          else
-            echo "ERROR: Cannot find the Python scraper file!"
-            echo "Available Python files:"
-            find . -name "*.py" -type f
-            exit 1
-          fi
-
-      - name: List output files
-        if: always()
-        run: |
-          echo "Generated files:"
-          ls -la *.csv 2>/dev/null || echo "No CSV files found"
+          python fpi_scrapper.py \
+            --start-year $START_YEAR \
+            --end-year $END_YEAR \
+            --use-last-day $USE_LAST_DAY
 
       - name: Upload CSV artifact
         if: always()
