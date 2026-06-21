@@ -164,19 +164,54 @@ jobs:
           path: "*FINAL*.db"
           retention-days: 90
 
+      - name: Clean up before commit
+        run: |
+          echo "Cleaning up temporary files..."
+          rm -rf dbs/
+          
+          # Remove old FINAL DBs, keep only newest
+          NEWEST=$(ls -t *_FINAL_*.db 2>/dev/null | head -1)
+          if [ -n "$NEWEST" ]; then
+            echo "Keeping: $NEWEST"
+            for f in *_FINAL_*.db; do
+              if [ "$f" != "$NEWEST" ]; then
+                echo "Removing old: $f"
+                rm -f "$f"
+              fi
+            done
+          fi
+          
+          echo "Files to commit:"
+          ls -lh *.db 2>/dev/null || echo "No .db files"
+
       - name: Commit and push final DB
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          FINAL_DB=$(find . -maxdepth 1 -name "*FINAL*.db" -type f | head -1)
+          FINAL_DB=$(ls *_FINAL_*.db 2>/dev/null | head -1)
+          
+          if [ -z "$FINAL_DB" ]; then
+            FINAL_DB=$(find . -name "*FINAL*.db" -type f 2>/dev/null | head -1)
+          fi
           
           if [ -n "$FINAL_DB" ]; then
-            echo "Found final DB: $FINAL_DB"
-            git add "$FINAL_DB"
-            git commit -m "Auto-updated FPI daily data [skip ci]" || echo "No changes to commit"
-            git push
+            echo "Found: $FINAL_DB"
+            DB_NAME=$(basename "$FINAL_DB")
+            
+            # Copy to current dir if needed
+            [ "$FINAL_DB" != "./$DB_NAME" ] && [ "$FINAL_DB" != "$DB_NAME" ] && cp "$FINAL_DB" "./$DB_NAME"
+            
+            git add -f "$DB_NAME"
+            
+            if git diff --staged --quiet; then
+              echo "No changes (file already up to date)"
+            else
+              git commit -m "Auto-updated FPI daily data [skip ci]"
+              git push
+              echo "✅ Committed and pushed!"
+            fi
           else
-            echo "No FINAL DB found"
-            ls -lh *.db 2>/dev/null
+            echo "❌ No FINAL DB found!"
+            ls -la
           fi
