@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../web_scrapper/fpi_scrapper"
+		}
+	],
+	"settings": {}
+}
