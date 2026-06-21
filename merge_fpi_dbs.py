@@ -7,7 +7,6 @@ def merge_databases(start_year, end_year):
     """Merge all chunk databases into one final database."""
     final_db = f"fpi_data_{start_year}_{end_year}_FINAL.db"
     
-    # Find all chunk databases
     db_files = glob.glob("dbs/**/*.db", recursive=True)
     
     if not db_files:
@@ -16,39 +15,33 @@ def merge_databases(start_year, end_year):
     
     print(f"Found {len(db_files)} database chunks to merge")
     
-    # Initialize final database
     with sqlite3.connect(final_db) as final_con:
-        # Get schema from first database
         first_db = db_files[0]
         with sqlite3.connect(first_db) as first_con:
             schema = first_con.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fpi_monthly_data'"
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fpi_daily_data'"
             ).fetchone()[0]
             final_con.execute(schema)
         
-        # Merge all chunks
         total_rows = 0
         for db_file in db_files:
             print(f"  Merging: {db_file}")
             with sqlite3.connect(db_file) as chunk_con:
-                # Get all rows from chunk
-                rows = chunk_con.execute("SELECT * FROM fpi_monthly_data").fetchall()
-                columns = [desc[0] for desc in chunk_con.execute("PRAGMA table_info(fpi_monthly_data)").fetchall()]
+                rows = chunk_con.execute("SELECT * FROM fpi_daily_data").fetchall()
+                columns = [desc[0] for desc in chunk_con.execute("PRAGMA table_info(fpi_daily_data)").fetchall()]
                 
-                # Ensure all columns exist in final database
-                existing_cols = [desc[0] for desc in final_con.execute("PRAGMA table_info(fpi_monthly_data)").fetchall()]
+                existing_cols = [desc[0] for desc in final_con.execute("PRAGMA table_info(fpi_daily_data)").fetchall()]
                 for col in columns:
                     if col not in existing_cols:
-                        final_con.execute(f'ALTER TABLE fpi_monthly_data ADD COLUMN "{col}" TEXT DEFAULT ""')
+                        final_con.execute(f'ALTER TABLE fpi_daily_data ADD COLUMN "{col}" TEXT DEFAULT ""')
                 
-                # Insert rows
                 placeholders = ", ".join("?" for _ in columns)
                 cols_sql = ", ".join(f'"{c}"' for c in columns)
                 
                 for row in rows:
                     try:
                         final_con.execute(
-                            f'INSERT OR REPLACE INTO fpi_monthly_data ({cols_sql}) VALUES ({placeholders})',
+                            f'INSERT OR REPLACE INTO fpi_daily_data ({cols_sql}) VALUES ({placeholders})',
                             row
                         )
                         total_rows += 1
@@ -61,10 +54,11 @@ def merge_databases(start_year, end_year):
     print(f"Final database: {final_db}")
     print(f"Total rows: {total_rows}")
     
-    # Show column count
     with sqlite3.connect(final_db) as con:
-        columns = [desc[0] for desc in con.execute("PRAGMA table_info(fpi_monthly_data)").fetchall()]
+        columns = [desc[0] for desc in con.execute("PRAGMA table_info(fpi_daily_data)").fetchall()]
+        dates = con.execute("SELECT COUNT(DISTINCT reporting_date) FROM fpi_daily_data").fetchone()[0]
         print(f"Total columns: {len(columns)}")
+        print(f"Unique dates: {dates}")
 
 if __name__ == "__main__":
     start_year = sys.argv[1] if len(sys.argv) > 1 else "2012"
