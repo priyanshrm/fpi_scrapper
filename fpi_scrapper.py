@@ -1,10 +1,8 @@
 import csv
 import time
 import calendar
-from datetime import datetime, timedelta
-
+import argparse
 from selenium import webdriver
-
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -12,17 +10,21 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
 # ========================
-#  CONFIGURATION
+#  ARGUMENTS
 # ========================
+parser = argparse.ArgumentParser()
+parser.add_argument("--start-year", type=int, default=2012)
+parser.add_argument("--end-year", type=int, default=2025)
+parser.add_argument("--use-last-day", type=str, default="True")
+args = parser.parse_args()
+
+START_YEAR = args.start_year
+END_YEAR = args.end_year
+USE_MONTH_LAST_DAY = args.use_last_day.lower() == "true"
+
 URL = "https://www.fpi.nsdl.co.in/web/Reports/Archive.aspx"
 OUTPUT_CSV = "fpi_monthly_totals.csv"
 
-START_YEAR = 2012
-END_YEAR = 2025
-# Set to True to get full‑month aggregates (use last day of month)
-USE_MONTH_LAST_DAY = False   # Change to True for full‑month totals
-
-# Main metric columns (excluding the derivative table)
 METRIC_COLS = [
     "Gross Purchases(Rs Crore)",
     "Gross Sales(Rs Crore)",
@@ -31,7 +33,7 @@ METRIC_COLS = [
 ]
 
 # ========================
-#  WEBDRIVER SETUP
+#  WEBDRIVER
 # ========================
 def get_driver():
     options = webdriver.ChromeOptions()
@@ -41,153 +43,246 @@ def get_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--start-maximized")
     options.add_argument("--incognito")
-    # Optional: ignore certificate errors if needed
     options.add_argument("--ignore-certificate-errors")
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
 # ========================
-#  HELPER TO SET DATE AND CLICK 'VIEW REPORT'
+#  ROBUST DATE SELECTION VIA CALENDAR WIDGET
 # ========================
-def set_date_and_view(driver, date_str):
+def set_date_calendar(driver, day, month, year):
     """
-    date_str: 'DD-Mon-YYYY' e.g. '01-Jan-2012'
-    Sets the hidden field, updates the visible field, and clicks the View Report link.
+    Clicks the calendar image, waits for the popup, navigates to
+    year/month, and clicks the desired day.
+    Falls back to direct hidden‑field injection if the calendar popup
+    does not appear after a few seconds.
     """
-    # 1. Set the hidden field that actually holds the date
+    # 1. Click the calendar icon
+    wait = WebDriverWait(driver, 10)
+    try:
+        cal_img = driver.find_element(By.ID, "imgtxtDate")
+        cal_img.click()
+    except Exception:
+        print("  ⚠️ Calendar image not found, falling back to hidden‑field method.")
+        set_date_hidden(driver, day, month, year)
+        return
+
+    # 2. Wait for the calendar popup (typical ASP.NET AjaxControlToolkit calendar)
+    try:
+        # The calendar is usually a div with class starting with 'ajax__calendar'
+        cal_container = WebDriverWait(driver, 6).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "div.ajax__calendar_container"))
+        )
+    except Exception:
+        print("  ⚠️ Calendar popup didn't appear, using hidden‑field fallback.")
+        set_date_hidden(driver, day, month, year)
+        return
+
+    # 3. Navigate year/month if needed
+    # The calendar shows month name and year in a <span class="ajax__calendar_month"> / year
+    try:
+        # Get current displayed month/year
+        month_year_text = cal_container.find_element(By.CSS_SELECTOR, "div.ajax__calendar_title").text
+        # Example format: "December, 2010"
+        parts = month_year_text.split(",")
+        current_month = parts[0].strip()
+        current_year = int(parts[1].strip())
+    except:
+        current_month = "Unknown"
+        current_year = 0
+
+    target_month_name = calendar.month_name[month]
+
+    # Navigate to the correct month/year (simple prev/next buttons)
+    while True:
+        if current_year == year and current_month == target_month_name:
+            break
+        # Click next month if target is in the future, else previous
+        if (year > current_year) or (year == current_year and month > calendar.month_name.index(current_month)):
+            # Next month button: class "ajax__calendar_next"
+            next_btn = cal_container.find_element(By.CSS_SELECTOR, "div.ajax__calendar_next a")
+            next_btn.click()
+        else:
+            prev_btn = cal_container.find_element(By.CSS_SELECTOR, "div.ajax__calendar_prev a")
+            prev_btn.click()
+        time.sleep(0.3)
+        # Re‑read current month/year
+        try:
+            month_year_text = cal_container.find_element(By.CSS_SELECTOR, "div.ajax__calendar_title").text
+            parts = month_year_text.split(",")
+            current_month = parts[0].strip()
+            current_year = int(parts[1].strip())
+        except:
+            print("  ⚠️ Could not read calendar title after navigation, falling back.")
+            set_date_hidden(driver, day, month, year)
+            return
+
+    # 4. Click the day cell
+    # Day cells are <td class="ajax__calendar_day"> or <td class="ajax__calendar_active"> etc.
+    # Find all clickable day numbers
+    day_cells = cal_container.find_elements(By.CSS_SELECTOR, "td.ajax__calendar_day, td.ajax__calendar_active")
+    for cell in day_cells:
+        if cell.text.strip() == str(day):
+            cell.click()
+            break
+    else:
+        print(f"  ⚠️ Day {day} not clickable in calendar, using hidden‑field method.")
+        set_date_hidden(driver, day, month, year)
+        return
+
+    # Wait a moment for the textbox to update
+    time.sleep(0.5)
+
+def set_date_hidden(driver, day, month, year):
+    """
+    Directly sets the hidden fields (used as fallback).
+    """
+    date_str = f"{day:02d}-{calendar.month_abbr[month]}-{year}"
     driver.execute_script(f"document.getElementById('hdnDate').value = '{date_str}';")
-    # 2. Update the visible (disabled) textbox (optional, but good for visual feedback)
     driver.execute_script(f"document.getElementById('txtDate').value = '{date_str}';")
-    # 3. Click the 'View Report' link
-    view_btn = driver.find_element(By.ID, "btnSubmit1")
-    view_btn.click()
+    print(f"  ℹ️  Date set via hidden field: {date_str}")
 
 # ========================
-#  WAIT FOR THE TOTAL ROW TO APPEAR
+#  CLICK VIEW REPORT BUTTON
 # ========================
-def wait_for_total_row(driver, month_name, timeout=30):
-    """
-    month_name: full month name, e.g. 'December'
-    Returns True if the row is found.
-    """
-    wait = WebDriverWait(driver, timeout)
+def click_view_report(driver):
+    wait = WebDriverWait(driver, 10)
+    view_btn = wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit1")))
+    view_btn.click()
+    # Small wait for postback to start
+    time.sleep(1)
+
+# ========================
+#  WAIT FOR TOTAL ROW
+# ========================
+def wait_for_total_row(driver, month_name, timeout=60):
     try:
-        # The total row contains <td rowspan="...">Total for December</td>
-        wait.until(EC.presence_of_element_located(
-            (By.XPATH, f"//td[contains(text(),'Total for {month_name}')]")
-        ))
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located(
+                (By.XPATH, f"//td[contains(text(),'Total for {month_name}')]")
+            )
+        )
         return True
     except Exception:
         return False
 
 # ========================
-#  PARSE THE TOTAL BLOCK AND RETURN COMBINATIONS
+#  PARSE THE MONTHLY TOTAL BLOCK
 # ========================
 def parse_total_block(driver, month_name):
     """
-    Locates the 'Total for <month>' row and extracts the 7‑row block.
-    Returns a dict like:
-    {
-        "Equity_Stock Exchange_Gross Purchases(Rs Crore)": "123.45",
-        "Equity_Stock Exchange_Gross Sales(Rs Crore)": "678.90",
-        ...
-    }
+    Finds the 'Total for <month>' row and collects all the
+    Debt/Equity – Investment Route combinations and their metrics.
+    Skips Sub‑total and Total rows.
     """
-    # Find the total row
-    total_row = driver.find_element(By.XPATH, f"//td[contains(text(),'Total for {month_name}')]/parent::tr")
-    # The block consists of the total_row + the next 6 <tr> elements
-    # We collect all rows until we hit a row that contains <td class="total">Total</td>
+    total_row = driver.find_element(
+        By.XPATH, f"//td[contains(text(),'Total for {month_name}')]/parent::tr"
+    )
     rows = []
     next_row = total_row
     while True:
         rows.append(next_row)
         next_row = next_row.find_element(By.XPATH, "following-sibling::tr[1]")
-        # Stop when we reach the row with class 'total' (the final Total)
         if "total" in next_row.get_attribute("class").split():
+            rows.append(next_row)  # include the final Total row (we'll skip it later)
             break
-    # Now rows[0] is the header, rows[1..6] are the data rows
-    # We'll parse each row.
+
     current_d_e = None
     combinations = {}
 
-    for row in rows[1:]:  # skip header
+    # Skip the header row (index 0)
+    for row in rows[1:]:
         cells = row.find_elements(By.TAG_NAME, "td")
-        # Row structure depends on rowspan. We detect Debt/Equity if present
+        if not cells:
+            continue
+
+        # Determine if this row contains a new Debt/Equity label
         if len(cells) >= 2 and cells[0].text.strip() in ("Equity", "Debt"):
             current_d_e = cells[0].text.strip()
             inv_route = cells[1].text.strip()
-            metrics = [cells[2].text.strip(), cells[3].text.strip(),
-                       cells[4].text.strip(), cells[5].text.strip()]
+            # Metrics: cells[2] to cells[5] are GP, GS, NI, NI US$
+            if len(cells) >= 6:
+                metrics = [cells[2].text.strip(), cells[3].text.strip(),
+                           cells[4].text.strip(), cells[5].text.strip()]
+            else:
+                continue
         elif len(cells) >= 1:
-            # No debt/equity cell, so inherit current_d_e
+            # Inherit Debt/Equity from previous row
+            if current_d_e is None:
+                continue
             inv_route = cells[0].text.strip()
-            metrics = [cells[1].text.strip(), cells[2].text.strip(),
-                       cells[3].text.strip(), cells[4].text.strip()]
+            if len(cells) >= 5:
+                metrics = [cells[1].text.strip(), cells[2].text.strip(),
+                           cells[3].text.strip(), cells[4].text.strip()]
+            else:
+                continue
         else:
             continue
 
-        # Skip "Sub-total" and "Total" rows
+        # Ignore Sub‑total and Total
         if inv_route in ("Sub-total", "Total") or not inv_route:
             continue
 
-        # Build column names
+        # Build column name for each metric
         for metric_name, val in zip(METRIC_COLS, metrics):
-            col = f"{current_d_e}_{inv_route}_{metric_name}"
-            # Replace any problematic characters for CSV headers (not really needed, but safe)
-            col = col.replace("/", "_").replace("&", "and")
+            col = f"{current_d_e}_{inv_route}_{metric_name}".replace("/", "_").replace("&", "and")
             combinations[col] = val
 
     return combinations
 
 # ========================
-#  MAIN SCRAPING LOOP
+#  MAIN SCRAPE LOOP
 # ========================
 def main():
     driver = get_driver()
     driver.get(URL)
-    # Wait for the page to fully load
+    # Ensure page is loaded
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "txtDate")))
 
     all_rows = []
-    fieldnames = ["Reporting Date"]  # Will be extended dynamically
+    fieldnames = ["Reporting Date"]
 
     for year in range(START_YEAR, END_YEAR + 1):
         for month in range(1, 13):
             month_name = calendar.month_name[month]
             if USE_MONTH_LAST_DAY:
-                # Use last calendar day of the month
                 last_day = calendar.monthrange(year, month)[1]
                 day = last_day
             else:
                 day = 1
 
-            date_str = f"{day:02d}-{month_name[:3]}-{year}"  # e.g. '01-Jan-2012'
-            print(f"Processing: {month_name} {year} → {date_str}")
+            print(f"Processing: {month_name} {year} → day {day}")
 
-            # Set date and click View Report
-            set_date_and_view(driver, date_str)
+            # Set date using the calendar widget (or hidden fallback)
+            set_date_calendar(driver, day, month, year)
 
-            # Wait for the total row
+            # Click the View Report button
+            click_view_report(driver)
+
+            # Wait for the total row to appear
             if not wait_for_total_row(driver, month_name, timeout=40):
-                print(f"  ⚠️  'Total for {month_name}' not found. Skipping.")
+                print(f"  ⚠️ 'Total for {month_name}' not found after waiting. Skipping.")
+                # Try to reload the page before next month to avoid stale state
+                driver.get(URL)
+                time.sleep(2)
                 continue
 
-            # Small extra wait for any dynamic content
+            # Extra stabilisation
             time.sleep(2)
 
-            # Parse the block
+            # Extract the combinations
             combos = parse_total_block(driver, month_name)
             row_data = {"Reporting Date": f"{year}-{month:02d}-{day:02d}"}
             row_data.update(combos)
             all_rows.append(row_data)
 
-            # Update fieldnames list (preserve order)
+            # Update field list
             for col in combos.keys():
                 if col not in fieldnames:
                     fieldnames.append(col)
 
-            print(f"  ✅ Extracted {len(combos)} values")
+            print(f"  ✅ Extracted {len(combos)} value cells")
 
     driver.quit()
 

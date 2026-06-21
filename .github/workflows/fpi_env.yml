@@ -1,10 +1,64 @@
-name: fpi-scraper
-channels:
-  - conda-forge
-  - defaults
-dependencies:
-  - python=3.10
-  - pip
-  - pip:
-    - selenium==4.15.2
-    - webdriver-manager==4.0.1
+name: Run FPI Archive Scraper
+
+on:
+  schedule:
+    # Run on the 1st of every month at 00:00 UTC (scrape previous month's full data)
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: 'Start year (inclusive)'
+        default: '2012'
+      end_year:
+        description: 'End year (inclusive)'
+        default: '2025'
+      use_last_day:
+        description: 'Use last day of month for full‑month totals?'
+        type: choice
+        options:
+          - 'True'   # last day → monthly aggregate
+          - 'False'  # 1st day → single‑day data
+        default: 'True'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v2
+        id: setup-chrome
+        with:
+          chrome-version: '149'
+          install-chromedriver: true
+
+      - name: Install dependencies
+        run: |
+          pip install selenium webdriver-manager
+
+      - name: Run Scraper
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+          START_YEAR: ${{ github.event.inputs.start_year || '2012' }}
+          END_YEAR: ${{ github.event.inputs.end_year || '2025' }}
+          USE_LAST_DAY: ${{ github.event.inputs.use_last_day || 'True' }}
+        run: |
+          python fpi_scraper.py \
+            --start-year $START_YEAR \
+            --end-year $END_YEAR \
+            --use-last-day $USE_LAST_DAY
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpi-monthly-totals
+          path: fpi_monthly_totals.csv
