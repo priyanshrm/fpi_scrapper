@@ -161,26 +161,26 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fpi-final-database
-          path: "*FINAL*.db"
+          path: "*.db"
           retention-days: 90
 
       - name: Clean up before commit
         run: |
           echo "Cleaning up temporary files..."
           rm -rf dbs/
-          
-          # Remove old FINAL DBs, keep only newest
-          NEWEST=$(ls -t *_FINAL_*.db 2>/dev/null | head -1)
+
+          # Keep only the newest .db file in the repo root, regardless of its name
+          NEWEST=$(ls -t *.db 2>/dev/null | head -1)
           if [ -n "$NEWEST" ]; then
             echo "Keeping: $NEWEST"
-            for f in *_FINAL_*.db; do
+            for f in *.db; do
               if [ "$f" != "$NEWEST" ]; then
                 echo "Removing old: $f"
                 rm -f "$f"
               fi
             done
           fi
-          
+
           echo "Files to commit:"
           ls -lh *.db 2>/dev/null || echo "No .db files"
 
@@ -188,22 +188,16 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
-          
-          FINAL_DB=$(ls *_FINAL_*.db 2>/dev/null | head -1)
-          
-          if [ -z "$FINAL_DB" ]; then
-            FINAL_DB=$(find . -name "*FINAL*.db" -type f 2>/dev/null | head -1)
-          fi
-          
-          if [ -n "$FINAL_DB" ]; then
-            echo "Found: $FINAL_DB"
-            DB_NAME=$(basename "$FINAL_DB")
-            
-            # Copy to current dir if needed
-            [ "$FINAL_DB" != "./$DB_NAME" ] && [ "$FINAL_DB" != "$DB_NAME" ] && cp "$FINAL_DB" "./$DB_NAME"
-            
-            git add -f "$DB_NAME"
-            
+
+          # Commit whatever .db file(s) exist in the repo root, no matter the name
+          DB_FILES=$(find . -maxdepth 1 -name "*.db" -type f 2>/dev/null)
+
+          if [ -n "$DB_FILES" ]; then
+            echo "Found DB file(s):"
+            echo "$DB_FILES"
+
+            git add -f $DB_FILES
+
             if git diff --staged --quiet; then
               echo "No changes (file already up to date)"
             else
@@ -212,6 +206,6 @@ jobs:
               echo "✅ Committed and pushed!"
             fi
           else
-            echo "❌ No FINAL DB found!"
+            echo "❌ No DB file found!"
             ls -la
           fi
