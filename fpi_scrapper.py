@@ -114,24 +114,38 @@ def ensure_columns(col_names):
             except Exception as e:
                 log(f"  Could not add column {safe_col}: {e}", "WARNING")
         con.commit()
+    log(f"  Added {len(new_cols)} new columns", "INFO")
 
-def upsert_daily_row(row_data):
-    ensure_columns(row_data.keys())
+def upsert_daily_rows(rows_list):
+    """Insert multiple wide-format rows at once."""
+    if not rows_list:
+        return
+    
+    # Collect all column names from all rows
+    all_col_names = set()
+    for row in rows_list:
+        all_col_names.update(row.keys())
+    
+    ensure_columns(all_col_names)
     all_cols = get_existing_columns()
     
-    full_row = {}
-    for col in all_cols:
-        full_row[col] = row_data.get(col, "")
-    
-    cols_sql = ", ".join(f'"{c}"' for c in all_cols)
-    placeholders = ", ".join("?" for _ in all_cols)
-    values = [full_row[c] for c in all_cols]
-    
     with get_connection() as con:
-        con.execute(
-            f'INSERT OR REPLACE INTO fpi_daily_wide ({cols_sql}) VALUES ({placeholders})',
-            values
-        )
+        for row_data in rows_list:
+            full_row = {}
+            for col in all_cols:
+                full_row[col] = row_data.get(col, "")
+            
+            cols_sql = ", ".join(f'"{c}"' for c in all_cols)
+            placeholders = ", ".join("?" for _ in all_cols)
+            values = [full_row[c] for c in all_cols]
+            
+            try:
+                con.execute(
+                    f'INSERT OR REPLACE INTO fpi_daily_wide ({cols_sql}) VALUES ({placeholders})',
+                    values
+                )
+            except Exception as e:
+                log(f"  DB insert error: {e}", "WARNING")
         con.commit()
 
 # ========================
@@ -245,33 +259,32 @@ def click_view_report(driver):
         return False
 
 # ========================
-#  EXTRACT ONE DAY'S DATA AND PIVOT TO WIDE
+#  EXTRACT ALL DAYS FROM A MONTHLY TABLE
 # ========================
-def extract_single_day_data(driver, target_date_str):
+def extract_all_days_from_month(driver, month_name, year):
     """
-    Extract data for ONE specific date from the daily table.
-    The table shows cumulative data up to the selected date,
-    but we only want the row for target_date_str.
-    
-    Returns a dict with ONE row: {reporting_date: ..., col1: val1, ...}
+    Select the last day of the month, then extract ALL trading days
+    visible in the table. Returns a list of dicts, one per trading day.
     """
-    wide_data = {}
+    all_daily_rows = []
     
     try:
         tables = driver.find_elements(By.CSS_SELECTOR, "table.tbls01")
         
         if not tables:
             log("  No data tables found!", "ERROR")
-            return None
+            return all_daily_rows
         
         table = tables[0]
         tr_elements = table.find_elements(By.TAG_NAME, "tr")
         
+        log(f"  Scanning {len(tr_elements)} table rows...", "INFO")
+        
         current_date = None
         current_debt_equity = None
         date_pattern = r'^\d{2}-[A-Za-z]{3}-\d{4}$'
-        found_target = False
-        rows_for_target = 0
+        current_row_data = {}
+        days_found = 0
         
         for tr in tr_elements:
             try:
@@ -281,6 +294,7 @@ def extract_single_day_data(driver, target_date_str):
                 
                 cell_texts = [c.text.strip() for c in cells]
                 
+                # Skip empty/header/footer rows
                 if all(t == "" for t in cell_texts):
                     continue
                 if cell_texts[0] in ("Reporting Date", "Debt/Equity"):
@@ -291,23 +305,24 @@ def extract_single_day_data(driver, target_date_str):
                     continue
                 if "Stock exchanges compile" in " ".join(cell_texts):
                     continue
+                if "Total for" in " ".join(cell_texts):
+                    continue
+                if "Total for 20" in " ".join(cell_texts):  # Yearly total
+                    continue
                 
                 # Check for date row
                 if re.match(date_pattern, cell_texts[0]):
+                    # Save previous date's data if exists
+                    if current_date and current_row_data:
+                        current_row_data["reporting_date"] = current_date
+                        all_daily_rows.append(current_row_data)
+                        days_found += 1
+                    
+                    # Start new date
                     current_date = cell_texts[0]
+                    current_row_data = {}
                     
-                    # If we've moved past our target date, stop
-                    if found_target and current_date != target_date_str:
-                        break
-                    
-                    # Check if this is our target date
-                    if current_date == target_date_str:
-                        found_target = True
-                    
-                    if not found_target:
-                        continue
-                    
-                    # Determine Debt/Equity and Investment Route
+                    # Parse first row of this date
                     if len(cell_texts) >= 3:
                         if cell_texts[1] in ("Equity", "Debt", "Debt-General Limit", "Debt-VRR", 
                                                "Debt-FAR", "Hybrid", "Mutual Funds", "AIFs"):
@@ -316,10 +331,7 @@ def extract_single_day_data(driver, target_date_str):
                         else:
                             inv_route = cell_texts[1]
                         
-                        if inv_route in ("Sub-total", "Total", ""):
-                            continue
-                        
-                        if len(cell_texts) >= 7:
+                        if inv_route not in ("Sub-total", "Total", "") and len(cell_texts) >= 7:
                             metrics = cell_texts[3:7]
                             metric_suffixes = [
                                 "Gross_Purchases_Rs_Crore",
@@ -327,25 +339,18 @@ def extract_single_day_data(driver, target_date_str):
                                 "Net_Investment_Rs_Crore",
                                 "Net_Investment_USD_million"
                             ]
-                            
                             for suffix, val in zip(metric_suffixes, metrics):
-                                col_name = sanitize_column_name(
-                                    f"{current_debt_equity}_{inv_route}_{suffix}"
-                                )
-                                wide_data[col_name] = val
-                                rows_for_target += 1
+                                col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
+                                current_row_data[col_name] = val
                     
-                elif found_target and len(cell_texts) >= 2 and cell_texts[0] in (
+                elif len(cell_texts) >= 2 and cell_texts[0] in (
                     "Equity", "Debt", "Debt-General Limit", "Debt-VRR", 
                     "Debt-FAR", "Hybrid", "Mutual Funds", "AIFs"
                 ):
                     current_debt_equity = cell_texts[0]
                     inv_route = cell_texts[1]
                     
-                    if inv_route in ("Sub-total", "Total", ""):
-                        continue
-                    
-                    if len(cell_texts) >= 6:
+                    if inv_route not in ("Sub-total", "Total", "") and len(cell_texts) >= 6:
                         metrics = cell_texts[2:6]
                         metric_suffixes = [
                             "Gross_Purchases_Rs_Crore",
@@ -353,91 +358,84 @@ def extract_single_day_data(driver, target_date_str):
                             "Net_Investment_Rs_Crore",
                             "Net_Investment_USD_million"
                         ]
-                        
                         for suffix, val in zip(metric_suffixes, metrics):
-                            col_name = sanitize_column_name(
-                                f"{current_debt_equity}_{inv_route}_{suffix}"
-                            )
-                            wide_data[col_name] = val
-                            rows_for_target += 1
+                            col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
+                            current_row_data[col_name] = val
                         
-                elif found_target and len(cell_texts) >= 5 and current_debt_equity:
+                elif len(cell_texts) >= 5 and current_debt_equity:
                     inv_route = cell_texts[0]
                     
-                    if inv_route in ("Sub-total", "Total", ""):
-                        continue
-                    
-                    metrics = cell_texts[1:5]
-                    metric_suffixes = [
-                        "Gross_Purchases_Rs_Crore",
-                        "Gross_Sales_Rs_Crore",
-                        "Net_Investment_Rs_Crore",
-                        "Net_Investment_USD_million"
-                    ]
-                    
-                    for suffix, val in zip(metric_suffixes, metrics):
-                        col_name = sanitize_column_name(
-                            f"{current_debt_equity}_{inv_route}_{suffix}"
-                        )
-                        wide_data[col_name] = val
-                        rows_for_target += 1
+                    if inv_route not in ("Sub-total", "Total", ""):
+                        metrics = cell_texts[1:5]
+                        metric_suffixes = [
+                            "Gross_Purchases_Rs_Crore",
+                            "Gross_Sales_Rs_Crore",
+                            "Net_Investment_Rs_Crore",
+                            "Net_Investment_USD_million"
+                        ]
+                        for suffix, val in zip(metric_suffixes, metrics):
+                            col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
+                            current_row_data[col_name] = val
                 
             except StaleElementReferenceException:
                 continue
             except Exception:
                 continue
         
-        if rows_for_target > 0:
-            wide_data["reporting_date"] = target_date_str
-            
-            combinations = rows_for_target // 4
-            log(f"  Extracted {combinations} combinations ({rows_for_target} metrics)", "SUCCESS")
-            
-            return wide_data
-        else:
-            log(f"  No data found for {target_date_str} (might be weekend/holiday)", "WARNING")
-            return None
+        # Save last date
+        if current_date and current_row_data:
+            current_row_data["reporting_date"] = current_date
+            all_daily_rows.append(current_row_data)
+            days_found += 1
+        
+        log(f"  Extracted {days_found} trading days for {month_name} {year}", "SUCCESS")
+        
+        if days_found > 0:
+            sample = all_daily_rows[0]
+            log(f"  Sample: {sample['reporting_date']} - {len(sample)-1} metrics", "INFO")
+        
+        return all_daily_rows
         
     except Exception as e:
         log(f"  Extraction error: {e}", "ERROR")
-        return None
+        traceback.print_exc()
+        return all_daily_rows
 
 # ========================
 #  MAIN SCRAPING LOOP
 # ========================
-def scrape_all_dates():
+def scrape_all_months():
     global start_time_global
     start_time_global = datetime.now()
     
     driver = None
-    total_processed = 0
-    failed_dates = []
+    total_days_saved = 0
+    failed_months = []
     
     log("=" * 60, "STAGE")
-    log("FPI ARCHIVE SCRAPER - DAILY WIDE FORMAT", "STAGE")
+    log("FPI ARCHIVE SCRAPER - OPTIMIZED MONTHLY EXTRACTION", "STAGE")
     log("=" * 60, "STAGE")
     log(f"Year range: {START_YEAR} - {END_YEAR}", "INFO")
-    log(f"Scraping EVERY calendar day (weekends/holidays will have no data)", "INFO")
+    log(f"Strategy: 1 page load per month, extract all trading days", "INFO")
     
     init_db()
     
-    # Generate ALL calendar dates
-    all_dates = []
+    # Generate months list
+    months_to_scrape = []
     for year in range(START_YEAR, END_YEAR + 1):
         for month in range(1, 13):
-            num_days = calendar.monthrange(year, month)[1]
-            for day in range(1, num_days + 1):
-                all_dates.append((day, month, year))
+            last_day = calendar.monthrange(year, month)[1]
+            months_to_scrape.append((year, month, last_day))
     
     # Apply chunking
     if END_INDEX:
-        all_dates = all_dates[START_INDEX:END_INDEX]
+        months_to_scrape = months_to_scrape[START_INDEX:END_INDEX]
     elif START_INDEX > 0:
-        all_dates = all_dates[START_INDEX:]
+        months_to_scrape = months_to_scrape[START_INDEX:]
     
-    total_dates = len(all_dates)
-    log(f"Total calendar dates to scrape: {total_dates}", "INFO")
-    log(f"Estimated trading days: ~{int(total_dates * 0.7)} (excluding weekends/holidays)", "INFO")
+    total_months = len(months_to_scrape)
+    log(f"Total months to scrape: {total_months}", "INFO")
+    log(f"Estimated time: {total_months * 15 // 60}-{total_months * 20 // 60} minutes", "INFO")
     
     try:
         driver = build_driver()
@@ -445,64 +443,62 @@ def scrape_all_dates():
         WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.ID, "txtDate")))
         log("Page ready. Starting scraping...\n", "SUCCESS")
         
-        consecutive_empty = 0
-        
-        for idx, (day, month, year) in enumerate(all_dates, 1):
-            date_str = f"{day:02d}-{calendar.month_abbr[month]}-{year}"
+        for idx, (year, month, last_day) in enumerate(months_to_scrape, 1):
+            month_name = calendar.month_name[month]
             
-            log_progress(idx, total_dates, date_str)
-            
-            # Skip if we've had many consecutive empty days (likely reached future dates)
-            if consecutive_empty > 10:
-                log(f"  Skipping {date_str} (10+ consecutive empty days, likely future date)", "INFO")
-                continue
+            log_progress(idx, total_months, f"{month_name} {year}")
             
             success = False
             
-            for attempt in range(1, 3):  # Only 2 attempts per date for speed
+            for attempt in range(1, 4):
                 try:
                     try:
                         driver.current_url
                     except:
                         driver = restart_browser(driver)
                     
-                    if not set_date(driver, day, month, year):
-                        if attempt < 2:
+                    # Set to last day of month
+                    if not set_date(driver, last_day, month, year):
+                        log(f"  Date set failed", "WARNING")
+                        if attempt < 3:
                             load_url_with_retry(driver, URL)
                             continue
                     
+                    log(f"  Date set: {last_day:02d}-{calendar.month_abbr[month]}-{year}", "SUCCESS")
+                    
                     if not click_view_report(driver):
-                        if attempt < 2:
+                        log(f"  View Report failed", "WARNING")
+                        if attempt < 3:
                             load_url_with_retry(driver, URL)
                             continue
                     
                     time.sleep(2)
                     
-                    daily_row = extract_single_day_data(driver, date_str)
+                    # Extract ALL days from this month's table
+                    daily_rows = extract_all_days_from_month(driver, month_name, year)
                     
-                    if daily_row and len(daily_row) > 1:
-                        upsert_daily_row(daily_row)
-                        total_processed += 1
-                        consecutive_empty = 0
+                    if daily_rows:
+                        upsert_daily_rows(daily_rows)
+                        total_days_saved += len(daily_rows)
+                        log(f"  ✅ Saved {len(daily_rows)} trading days for {month_name} {year}", "SUCCESS")
+                        print()
                         success = True
                         break
                     else:
-                        consecutive_empty += 1
-                        log(f"  No data (weekend/holiday) - {consecutive_empty} consecutive empty", "INFO")
-                        success = True  # Not an error, just no data
-                        break
+                        log(f"  No data extracted (attempt {attempt}/3)", "WARNING")
+                        if attempt < 3:
+                            load_url_with_retry(driver, URL)
                 
                 except Exception as e:
-                    log(f"  Error: {e}", "ERROR")
-                    if attempt < 2:
+                    log(f"  Error (attempt {attempt}/3): {e}", "ERROR")
+                    if attempt < 3:
                         try:
                             load_url_with_retry(driver, URL)
                         except:
                             driver = restart_browser(driver)
                 
-                if attempt == 2 and not success:
-                    failed_dates.append(date_str)
-                    consecutive_empty += 1
+                if attempt == 3 and not success:
+                    failed_months.append(f"{month_name} {year}")
     
     except Exception as e:
         log(f"FATAL ERROR: {e}", "ERROR")
@@ -521,22 +517,26 @@ def scrape_all_dates():
         log("SCRAPING COMPLETE", "STAGE")
         log("=" * 60, "STAGE")
         log(f"Total time: {timedelta(seconds=int(total_elapsed))}", "INFO")
-        log(f"Dates with data: {total_processed}", "SUCCESS")
-        log(f"Dates without data (weekends/holidays): {total_dates - total_processed - len(failed_dates)}", "INFO")
+        log(f"Months processed: {total_months - len(failed_months)}/{total_months}", "SUCCESS")
+        log(f"Total trading days saved: {total_days_saved}", "SUCCESS")
         
-        if failed_dates:
-            log(f"Failed dates ({len(failed_dates)}): {failed_dates[:10]}...", "ERROR")
+        if failed_months:
+            log(f"Failed months ({len(failed_months)}):", "ERROR")
+            for m in failed_months:
+                log(f"  - {m}", "ERROR")
         else:
-            log("NO FAILED DATES!", "SUCCESS")
+            log("ALL MONTHS SUCCESSFULLY SCRAPED!", "SUCCESS")
         
         columns = get_existing_columns()
         with get_connection() as con:
             count = con.execute("SELECT COUNT(*) FROM fpi_daily_wide").fetchone()[0]
+            dates = con.execute("SELECT COUNT(DISTINCT reporting_date) FROM fpi_daily_wide").fetchone()[0]
         
         log(f"\nDatabase: {DB_FILE}", "INFO")
         log(f"Rows (trading days): {count}", "INFO")
+        log(f"Unique dates: {dates}", "INFO")
         log(f"Columns: {len(columns)} (1 date + {len(columns)-1} metrics)", "INFO")
         print()
 
 if __name__ == "__main__":
-    scrape_all_dates()
+    scrape_all_months()
