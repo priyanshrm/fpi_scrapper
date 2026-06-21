@@ -184,16 +184,15 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          FINAL_DB=$(find . -name "*FINAL*.db" -type f | head -1)
+          FINAL_DB=$(find . -maxdepth 1 -name "*FINAL*.db" -type f | head -1)
           
           if [ -n "$FINAL_DB" ]; then
             echo "Found final DB: $FINAL_DB"
-            cp "$FINAL_DB" .
-            DB_NAME=$(basename "$FINAL_DB")
-            git add "$DB_NAME"
+            git add "$FINAL_DB"
             git commit -m "Auto-updated FPI daily data [skip ci]" || echo "No changes to commit"
             git push
           else
-            echo "No FINAL DB found to commit"
+            echo "No FINAL DB found in current directory"
+            echo "Searching everywhere..."
             find . -name "*.db" -type f
           fi
