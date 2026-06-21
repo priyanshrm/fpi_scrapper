@@ -16,7 +16,7 @@ def merge_databases(start_year, end_year):
         # Copy schema from first DB
         with sqlite3.connect(db_files[0]) as first_con:
             schema = first_con.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fpi_monthly_data'"
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fpi_wide_data'"
             ).fetchone()[0]
             final_con.execute(schema)
         
@@ -24,22 +24,22 @@ def merge_databases(start_year, end_year):
         for db_file in db_files:
             print(f"  Merging: {db_file}")
             with sqlite3.connect(db_file) as chunk_con:
-                # Get columns (index 1 = name)
-                cols = [r[1] for r in chunk_con.execute("PRAGMA table_info(fpi_monthly_data)").fetchall()]
+                # Get columns (name is at index 1)
+                cols = [r[1] for r in chunk_con.execute("PRAGMA table_info(fpi_wide_data)").fetchall()]
                 
                 # Ensure all columns exist in final DB
-                existing = [r[1] for r in final_con.execute("PRAGMA table_info(fpi_monthly_data)").fetchall()]
+                existing = [r[1] for r in final_con.execute("PRAGMA table_info(fpi_wide_data)").fetchall()]
                 for c in cols:
                     if c not in existing:
-                        final_con.execute(f'ALTER TABLE fpi_monthly_data ADD COLUMN "{c}" TEXT DEFAULT ""')
+                        final_con.execute(f'ALTER TABLE fpi_wide_data ADD COLUMN "{c}" TEXT DEFAULT ""')
                 
                 # Insert rows
-                for row in chunk_con.execute("SELECT * FROM fpi_monthly_data").fetchall():
+                for row in chunk_con.execute("SELECT * FROM fpi_wide_data").fetchall():
                     try:
                         placeholders = ", ".join("?" for _ in cols)
                         cols_sql = ", ".join(f'"{c}"' for c in cols)
                         final_con.execute(
-                            f'INSERT OR REPLACE INTO fpi_monthly_data ({cols_sql}) VALUES ({placeholders})',
+                            f'INSERT OR REPLACE INTO fpi_wide_data ({cols_sql}) VALUES ({placeholders})',
                             row
                         )
                         total += 1

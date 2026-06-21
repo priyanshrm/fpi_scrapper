@@ -2,6 +2,7 @@ name: Run FPI Archive Scraper
 
 on:
   schedule:
+    # Run on the 1st of every month at 00:00 UTC
     - cron: '0 0 1 * *'
   workflow_dispatch:
     inputs:
@@ -12,7 +13,7 @@ on:
         description: 'End year (inclusive)'
         default: '2025'
       use_last_day:
-        description: 'Use last day of month for full‑month totals?'
+        description: 'Use last day of month? (True = last day, False = 1st day)'
         type: choice
         options:
           - 'True'
@@ -20,22 +21,31 @@ on:
         default: 'True'
 
 jobs:
-  # First, calculate the number of months and create dynamic chunks
   calculate-chunks:
     runs-on: ubuntu-latest
     outputs:
       chunks: ${{ steps.chunks.outputs.matrix }}
+      start_year: ${{ steps.vars.outputs.start_year }}
+      end_year: ${{ steps.vars.outputs.end_year }}
+      use_last_day: ${{ steps.vars.outputs.use_last_day }}
     steps:
+      - name: Set variables
+        id: vars
+        run: |
+          echo "start_year=${{ github.event.inputs.start_year || '2012' }}" >> $GITHUB_OUTPUT
+          echo "end_year=${{ github.event.inputs.end_year || '2025' }}" >> $GITHUB_OUTPUT
+          echo "use_last_day=${{ github.event.inputs.use_last_day || 'True' }}" >> $GITHUB_OUTPUT
+
       - name: Calculate chunk matrix
         id: chunks
         run: |
-          START_YEAR=${{ github.event.inputs.start_year || '2012' }}
-          END_YEAR=${{ github.event.inputs.end_year || '2025' }}
+          START_YEAR=${{ steps.vars.outputs.start_year }}
+          END_YEAR=${{ steps.vars.outputs.end_year }}
           
           # Calculate total months
           TOTAL_MONTHS=$(( (END_YEAR - START_YEAR + 1) * 12 ))
           
-          # Determine optimal number of chunks (max 4, min 1)
+          # Determine number of chunks
           if [ $TOTAL_MONTHS -le 12 ]; then
             CHUNKS=1
           elif [ $TOTAL_MONTHS -le 48 ]; then
@@ -48,11 +58,11 @@ jobs:
           
           CHUNK_SIZE=$(( TOTAL_MONTHS / CHUNKS ))
           
-          # Generate matrix JSON
           echo "Total months: $TOTAL_MONTHS"
           echo "Chunks: $CHUNKS"
           echo "Chunk size: $CHUNK_SIZE"
           
+          # Generate matrix JSON
           MATRIX="{\"include\":["
           for i in $(seq 0 $((CHUNKS - 1))); do
             START=$(( i * CHUNK_SIZE ))
@@ -105,19 +115,23 @@ jobs:
           CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: |
           python fpi_scrapper.py \
-            --start-year ${{ github.event.inputs.start_year || '2012' }} \
-            --end-year ${{ github.event.inputs.end_year || '2025' }} \
-            --use-last-day ${{ github.event.inputs.use_last_day || 'True' }} \
+            --start-year ${{ needs.calculate-chunks.outputs.start_year }} \
+            --end-year ${{ needs.calculate-chunks.outputs.end_year }} \
+            --use-last-day ${{ needs.calculate-chunks.outputs.use_last_day }} \
             --start ${{ matrix.start }} \
             --end ${{ matrix.end }}
 
       - name: Upload DB chunk
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fpi-db-${{ matrix.start }}-${{ matrix.end }}
           path: "*.db"
+          retention-days: 7
+
   merge:
     needs: scrape
+    if: always() && needs.scrape.result != 'skipped'
     runs-on: ubuntu-latest
 
     steps:
@@ -133,39 +147,43 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dbs/
+          pattern: fpi-db-*
+          merge-multiple: false
 
-      - name: List downloaded files
+      - name: List downloaded artifacts
         run: |
-          echo "Downloaded files:"
-          find dbs/ -type f -name "*.db" || echo "No DB files found"
+          echo "Downloaded artifacts:"
+          find dbs/ -name "*.db" -type f || echo "No DB files found"
 
       - name: Merge DBs
         run: |
           python merge_fpi_dbs.py \
-            ${{ github.event.inputs.start_year || '2012' }} \
-            ${{ github.event.inputs.end_year || '2025' }}
+            ${{ needs.calculate-chunks.outputs.start_year }} \
+            ${{ needs.calculate-chunks.outputs.end_year }}
 
-      - name: List output files
+      - name: List output
         run: |
-          echo "Files after merge:"
-          ls -la *.db 2>/dev/null || echo "No .db files in root"
-          ls -la dbs/ 2>/dev/null || echo "No dbs folder"
+          echo "Final database:"
+          ls -la *_FINAL_*.db 2>/dev/null || echo "No FINAL DB found"
+          ls -la *.db 2>/dev/null || echo "No DB files found"
+
+      - name: Upload final DB as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpi-final-db
+          path: "*_FINAL_*.db"
+          retention-days: 90
 
       - name: Commit and push final DB
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          # Remove the dbs folder (we don't want to commit chunks)
-          rm -rf dbs/
-          
-          # Stage the final DB
-          git add fpi_data_*_FINAL_*.db
-          
-          # Check if anything was staged
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Auto-updated FPI monthly data [skip ci]"
+          # Check if final DB exists
+          if ls *_FINAL_*.db 1> /dev/null 2>&1; then
+            git add *_FINAL_*.db
+            git commit -m "Auto-updated FPI daily data [skip ci]" || echo "No changes to commit"
             git push
+          else
+            echo "No FINAL DB to commit"
           fi
