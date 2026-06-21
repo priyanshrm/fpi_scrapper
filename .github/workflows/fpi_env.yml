@@ -23,21 +23,21 @@ jobs:
       - name: Set variables
         id: vars
         run: |
-          echo "start_year=${{ github.event.inputs.start_year || '2012' }}" >> $GITHUB_OUTPUT
-          echo "end_year=${{ github.event.inputs.end_year || '2025' }}" >> $GITHUB_OUTPUT
+          START_YEAR="${{ github.event.inputs.start_year || '2012' }}"
+          END_YEAR="${{ github.event.inputs.end_year || '2025' }}"
+          echo "start_year=$START_YEAR" >> $GITHUB_OUTPUT
+          echo "end_year=$END_YEAR" >> $GITHUB_OUTPUT
+          echo "Start year: $START_YEAR"
+          echo "End year: $END_YEAR"
 
       - name: Calculate chunk matrix
         id: chunks
         run: |
-          START_YEAR=${{ steps.vars.outputs.start_year }}
-          END_YEAR=${{ steps.vars.outputs.end_year }}
+          START_YEAR="${{ steps.vars.outputs.start_year }}"
+          END_YEAR="${{ steps.vars.outputs.end_year }}"
           
-          # Calculate total MONTHS
           TOTAL_MONTHS=$(( (END_YEAR - START_YEAR + 1) * 12 ))
           
-          echo "Total months: $TOTAL_MONTHS"
-          
-          # Determine number of chunks (max 4)
           if [ $TOTAL_MONTHS -le 12 ]; then
             CHUNKS=1
           elif [ $TOTAL_MONTHS -le 48 ]; then
@@ -48,23 +48,16 @@ jobs:
             CHUNKS=4
           fi
           
-          echo "Chunks: $CHUNKS"
-          
-          # Calculate months per chunk (integer division)
           MONTHS_PER_CHUNK=$(( TOTAL_MONTHS / CHUNKS ))
           REMAINDER=$(( TOTAL_MONTHS % CHUNKS ))
           
-          echo "Months per chunk: $MONTHS_PER_CHUNK"
-          echo "Remainder: $REMAINDER"
+          echo "Total months: $TOTAL_MONTHS, Chunks: $CHUNKS, Months/chunk: $MONTHS_PER_CHUNK, Remainder: $REMAINDER"
           
-          # Generate matrix JSON
           MATRIX="{\"include\":["
           CURRENT_START=0
           
           for i in $(seq 0 $((CHUNKS - 1))); do
-            # Calculate end for this chunk
             if [ $i -lt $REMAINDER ]; then
-              # First few chunks get one extra month
               CHUNK_SIZE=$(( MONTHS_PER_CHUNK + 1 ))
             else
               CHUNK_SIZE=$MONTHS_PER_CHUNK
@@ -72,7 +65,7 @@ jobs:
             
             CURRENT_END=$(( CURRENT_START + CHUNK_SIZE ))
             
-            echo "  Chunk $((i+1)): months $CURRENT_START to $CURRENT_END ($CHUNK_SIZE months)"
+            echo "  Chunk $((i+1)): start=$CURRENT_START, end=$CURRENT_END, size=$CHUNK_SIZE"
             
             if [ $i -gt 0 ]; then
               MATRIX+=","
@@ -84,6 +77,7 @@ jobs:
           MATRIX+="]}"
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Final matrix: $MATRIX"
 
   scrape:
     needs: calculate-chunks
@@ -135,7 +129,9 @@ jobs:
           retention-days: 7
 
   merge:
-    needs: scrape
+    needs: 
+      - scrape
+      - calculate-chunks
     if: always() && !cancelled()
     runs-on: ubuntu-latest
 
@@ -147,6 +143,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Set year variables
+        id: years
+        run: |
+          echo "start_year=${{ needs.calculate-chunks.outputs.start_year }}" >> $GITHUB_OUTPUT
+          echo "end_year=${{ needs.calculate-chunks.outputs.end_year }}" >> $GITHUB_OUTPUT
+          echo "Years: ${{ needs.calculate-chunks.outputs.start_year }} - ${{ needs.calculate-chunks.outputs.end_year }}"
 
       - name: Download all DB chunks
         uses: actions/download-artifact@v4
@@ -162,23 +165,18 @@ jobs:
 
       - name: Merge DBs
         run: |
-          python merge_fpi_dbs.py \
-            ${{ needs.calculate-chunks.outputs.start_year }} \
-            ${{ needs.calculate-chunks.outputs.end_year }}
-            
+          python merge_fpi_dbs.py ${{ steps.years.outputs.start_year }} ${{ steps.years.outputs.end_year }}
+
       - name: Show final output
         run: |
-          echo "Files in workspace:"
-          ls -lh *.db 2>/dev/null || echo "No .db files"
-          ls -lh *_FINAL_*.db 2>/dev/null || echo "No FINAL DB found"
-          echo "---"
-          find . -name "*.db" -type f 2>/dev/null || echo "No DB files anywhere"
+          echo "All .db files in workspace:"
+          find . -name "*.db" -type f -ls
 
       - name: Upload final DB as artifact
         uses: actions/upload-artifact@v4
         with:
           name: fpi-final-database
-          path: "*_FINAL_*.db"
+          path: "**/*FINAL*.db"
           retention-days: 90
 
       - name: Commit and push final DB
@@ -186,14 +184,16 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           
-          FINAL_DB=$(ls *_FINAL_*.db 2>/dev/null | head -1)
+          FINAL_DB=$(find . -name "*FINAL*.db" -type f | head -1)
           
           if [ -n "$FINAL_DB" ]; then
             echo "Found final DB: $FINAL_DB"
-            git add "$FINAL_DB"
+            cp "$FINAL_DB" .
+            DB_NAME=$(basename "$FINAL_DB")
+            git add "$DB_NAME"
             git commit -m "Auto-updated FPI daily data [skip ci]" || echo "No changes to commit"
             git push
           else
             echo "No FINAL DB found to commit"
-            ls -lh *.db 2>/dev/null
+            find . -name "*.db" -type f
           fi
