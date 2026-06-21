@@ -2,7 +2,6 @@ name: Run FPI Archive Scraper
 
 on:
   schedule:
-    # Run on the 1st of every month at 00:00 UTC
     - cron: '0 0 1 * *'
   workflow_dispatch:
     inputs:
@@ -33,41 +32,54 @@ jobs:
           START_YEAR=${{ steps.vars.outputs.start_year }}
           END_YEAR=${{ steps.vars.outputs.end_year }}
           
-          # Calculate total DAYS (approximate)
-          YEARS=$(( END_YEAR - START_YEAR + 1 ))
-          TOTAL_DAYS=$(( YEARS * 365 ))
+          # Calculate total MONTHS
+          TOTAL_MONTHS=$(( (END_YEAR - START_YEAR + 1) * 12 ))
           
-          # Determine number of chunks based on total days
-          if [ $TOTAL_DAYS -le 180 ]; then
+          echo "Total months: $TOTAL_MONTHS"
+          
+          # Determine number of chunks (max 4)
+          if [ $TOTAL_MONTHS -le 12 ]; then
             CHUNKS=1
-          elif [ $TOTAL_DAYS -le 730 ]; then
+          elif [ $TOTAL_MONTHS -le 48 ]; then
             CHUNKS=2
-          elif [ $TOTAL_DAYS -le 1800 ]; then
+          elif [ $TOTAL_MONTHS -le 96 ]; then
             CHUNKS=3
           else
             CHUNKS=4
           fi
           
-          # Generate all dates and split into chunks
-          DATES_PER_CHUNK=$(( TOTAL_DAYS / CHUNKS ))
-          
-          echo "Total days (approx): $TOTAL_DAYS"
           echo "Chunks: $CHUNKS"
-          echo "Days per chunk: $DATES_PER_CHUNK"
+          
+          # Calculate months per chunk (integer division)
+          MONTHS_PER_CHUNK=$(( TOTAL_MONTHS / CHUNKS ))
+          REMAINDER=$(( TOTAL_MONTHS % CHUNKS ))
+          
+          echo "Months per chunk: $MONTHS_PER_CHUNK"
+          echo "Remainder: $REMAINDER"
           
           # Generate matrix JSON
           MATRIX="{\"include\":["
+          CURRENT_START=0
+          
           for i in $(seq 0 $((CHUNKS - 1))); do
-            START=$(( i * DATES_PER_CHUNK ))
-            if [ $i -eq $((CHUNKS - 1)) ]; then
-              END=99999  # Large number to capture all remaining
+            # Calculate end for this chunk
+            if [ $i -lt $REMAINDER ]; then
+              # First few chunks get one extra month
+              CHUNK_SIZE=$(( MONTHS_PER_CHUNK + 1 ))
             else
-              END=$(( (i + 1) * DATES_PER_CHUNK ))
+              CHUNK_SIZE=$MONTHS_PER_CHUNK
             fi
+            
+            CURRENT_END=$(( CURRENT_START + CHUNK_SIZE ))
+            
+            echo "  Chunk $((i+1)): months $CURRENT_START to $CURRENT_END ($CHUNK_SIZE months)"
+            
             if [ $i -gt 0 ]; then
               MATRIX+=","
             fi
-            MATRIX+="{\"start\":$START,\"end\":$END}"
+            MATRIX+="{\"start\":$CURRENT_START,\"end\":$CURRENT_END}"
+            
+            CURRENT_START=$CURRENT_END
           done
           MATRIX+="]}"
           
@@ -80,7 +92,7 @@ jobs:
       matrix: ${{ fromJson(needs.calculate-chunks.outputs.chunks) }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours max per chunk
+    timeout-minutes: 360
 
     steps:
       - name: Checkout code
