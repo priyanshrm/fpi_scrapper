@@ -40,9 +40,8 @@ END_INDEX = args.end
 URL = "https://www.fpi.nsdl.co.in/web/Reports/Archive.aspx"
 DB_FILE = f"fpi_data_{START_YEAR}_{END_YEAR}_{START_INDEX}_{END_INDEX if END_INDEX else 'all'}.db"
 
-# Fixed columns for primary key
-FIXED_FIELDS = ["reporting_date", "debt_equity", "investment_route"]
-KEY_FIELDS = ["reporting_date", "debt_equity", "investment_route"]
+# Fixed columns
+FIXED_FIELDS = ["reporting_date"]
 
 # ========================
 #  LOGGING HELPERS
@@ -88,48 +87,65 @@ def get_connection():
     return sqlite3.connect(DB_FILE)
 
 def init_db():
+    """Create the table with only reporting_date as fixed column."""
     log("Initializing database...", "STAGE")
     with get_connection() as con:
         con.execute("""
-            CREATE TABLE IF NOT EXISTS fpi_daily_data (
-                reporting_date TEXT NOT NULL,
-                debt_equity TEXT NOT NULL,
-                investment_route TEXT NOT NULL,
-                gross_purchases_rs_crore TEXT DEFAULT '',
-                gross_sales_rs_crore TEXT DEFAULT '',
-                net_investment_rs_crore TEXT DEFAULT '',
-                net_investment_usd_million TEXT DEFAULT '',
-                PRIMARY KEY (reporting_date, debt_equity, investment_route)
+            CREATE TABLE IF NOT EXISTS fpi_monthly_data (
+                "reporting_date" TEXT PRIMARY KEY
             )
         """)
         con.commit()
     log(f"Database ready: {DB_FILE}", "SUCCESS")
 
-def insert_daily_rows(rows):
-    """Insert multiple daily rows at once."""
-    if not rows:
+def get_existing_columns():
+    """Return current column names."""
+    with get_connection() as con:
+        cur = con.execute("PRAGMA table_info(fpi_monthly_data)")
+        return [row[1] for row in cur.fetchall()]
+
+def ensure_columns(col_names):
+    """Add new combination columns that don't exist yet."""
+    existing = set(get_existing_columns())
+    new_cols = [c for c in col_names if c not in existing]
+    if not new_cols:
         return
+    with get_connection() as con:
+        for col in new_cols:
+            safe_col = sanitize_column_name(col)
+            try:
+                con.execute(f'ALTER TABLE fpi_monthly_data ADD COLUMN "{safe_col}" TEXT DEFAULT ""')
+            except Exception as e:
+                log(f"Could not add column {safe_col}: {e}", "WARNING")
+        con.commit()
+    log(f"Added {len(new_cols)} new columns to database", "INFO")
+
+def sanitize_column_name(name):
+    """Make column name SQL-safe but still descriptive."""
+    return name.replace("(", "").replace(")", "").replace("/", "_").replace("&", "and").replace("$", "USD").replace(" ", "_").replace("-", "_").replace(".", "_")
+
+def upsert_monthly_row(row_data):
+    """Insert or replace a monthly row with dynamic columns."""
+    # Ensure all columns exist
+    ensure_columns(row_data.keys())
+    
+    # Get all existing columns
+    all_cols = get_existing_columns()
+    
+    # Build complete row (missing columns get empty string)
+    full_row = {}
+    for col in all_cols:
+        full_row[col] = row_data.get(col, "")
+    
+    cols_sql = ", ".join(f'"{c}"' for c in all_cols)
+    placeholders = ", ".join("?" for _ in all_cols)
+    values = [full_row[c] for c in all_cols]
     
     with get_connection() as con:
-        for row in rows:
-            try:
-                con.execute("""
-                    INSERT OR REPLACE INTO fpi_daily_data 
-                    (reporting_date, debt_equity, investment_route, 
-                     gross_purchases_rs_crore, gross_sales_rs_crore,
-                     net_investment_rs_crore, net_investment_usd_million)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row["reporting_date"],
-                    row["debt_equity"],
-                    row["investment_route"],
-                    row["gross_purchases_rs_crore"],
-                    row["gross_sales_rs_crore"],
-                    row["net_investment_rs_crore"],
-                    row["net_investment_usd_million"],
-                ))
-            except Exception as e:
-                log(f"  DB insert error: {e}", "WARNING")
+        con.execute(
+            f'INSERT OR REPLACE INTO fpi_monthly_data ({cols_sql}) VALUES ({placeholders})',
+            values
+        )
         con.commit()
 
 # ========================
@@ -154,7 +170,7 @@ def build_driver():
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
     
     if chrome_path and chromedriver_path:
-        log(f"Using GitHub Actions Chrome: {chrome_path}", "INFO")
+        log(f"Using GitHub Actions Chrome", "INFO")
         options.binary_location = chrome_path
         service = Service(executable_path=chromedriver_path)
     else:
@@ -196,7 +212,7 @@ def load_url_with_retry(driver, url, max_retries=5):
                 log(f"  Error: {error_msg[:100]}", "ERROR")
             
             if attempt == max_retries:
-                raise ConnectionError(f"Failed to load URL after {max_retries} attempts")
+                raise
 
 def restart_browser(driver, max_attempts=3):
     log("Restarting browser...", "WARNING")
@@ -238,13 +254,10 @@ def set_date(driver, day, month, year):
     
     time.sleep(0.3)
     
-    # Verify
     actual = driver.execute_script("return document.getElementById('hdnDate').value;")
     if date_str in actual:
-        log(f"  Date set: {date_str}", "SUCCESS")
         return True
     
-    log(f"  Date verification failed. Expected: {date_str}, Got: {actual}", "WARNING")
     return False
 
 # ========================
@@ -252,172 +265,152 @@ def set_date(driver, day, month, year):
 # ========================
 def click_view_report(driver):
     """Click View Report button."""
-    log("  Clicking 'View Report'...", "INFO")
-    
     view_btn = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, "btnSubmit1"))
     )
     driver.execute_script("arguments[0].click();", view_btn)
     time.sleep(3)
     
-    # Wait for table to load
     try:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "dvArchiveData"))
         )
-        log("  Table loaded", "SUCCESS")
         return True
     except TimeoutException:
-        log("  Table load timeout", "WARNING")
         return False
 
 # ========================
-#  EXTRACT ALL DAILY ROWS
+#  EXTRACT MONTHLY TOTAL AND PIVOT TO WIDE FORMAT
 # ========================
-def extract_all_daily_rows(driver):
+def extract_monthly_totals(driver, month_name):
     """
-    Extract ALL daily rows from the first table on the page.
-    Each row has: Reporting Date, Debt/Equity, Investment Route, 
-                  Gross Purchases, Gross Sales, Net Investment, Net Investment US$
-    
-    Returns a list of dicts, each dict is one row.
+    Find the 'Total for Month' row and extract all combinations.
+    Returns a single dict (one row) with all combinations as columns.
     """
-    rows = []
     
-    try:
-        # Find the main data table (first table with class 'tbls01')
-        tables = driver.find_elements(By.CSS_SELECTOR, "table.tbls01")
-        
-        if not tables:
-            log("  No data tables found on page!", "ERROR")
-            return rows
-        
-        # Use the first table (daily trends)
-        table = tables[0]
-        
-        # Get all rows from the table
-        tr_elements = table.find_elements(By.TAG_NAME, "tr")
-        
-        log(f"  Found {len(tr_elements)} rows in table", "INFO")
-        
-        current_date = None
-        current_debt_equity = None
-        daily_rows_found = 0
-        
-        for tr in tr_elements:
-            try:
-                cells = tr.find_elements(By.TAG_NAME, "td")
-                if not cells:
-                    continue
-                
-                cell_texts = [c.text.strip() for c in cells]
-                
-                # Skip empty rows
-                if all(t == "" for t in cell_texts):
-                    continue
-                
-                # Skip header rows
-                if cell_texts[0] in ("Reporting Date", "Debt/Equity"):
-                    continue
-                
-                # Skip table title rows
-                if "Daily Trends" in " ".join(cell_texts):
-                    continue
-                
-                # Skip the disclaimer/note rows
-                if "The data presented above" in " ".join(cell_texts):
-                    continue
-                if "Stock exchanges compile" in " ".join(cell_texts):
-                    continue
-                
-                # Check if this row has a date (like "01-Dec-2010")
-                date_pattern = r'^\d{2}-[A-Za-z]{3}-\d{4}$'
-                
-                if len(cell_texts) > 0 and re.match(date_pattern, cell_texts[0]):
-                    # This is a date header row
-                    current_date = cell_texts[0]
-                    
-                    # Also has debt/equity and possibly investment route
-                    if len(cell_texts) >= 3:
-                        current_debt_equity = cell_texts[1] if cell_texts[1] in ("Equity", "Debt") else current_debt_equity
-                        inv_route = cell_texts[2] if len(cell_texts) > 2 else ""
-                        
-                        # Skip sub-total rows
-                        if inv_route in ("Sub-total", "Total", ""):
-                            continue
-                        
-                        if len(cell_texts) >= 7:
-                            row_data = {
-                                "reporting_date": current_date,
-                                "debt_equity": current_debt_equity,
-                                "investment_route": inv_route,
-                                "gross_purchases_rs_crore": cell_texts[3],
-                                "gross_sales_rs_crore": cell_texts[4],
-                                "net_investment_rs_crore": cell_texts[5],
-                                "net_investment_usd_million": cell_texts[6],
-                            }
-                            rows.append(row_data)
-                            daily_rows_found += 1
-                    
-                elif len(cell_texts) >= 2 and cell_texts[0] in ("Equity", "Debt"):
-                    # Debt/Equity row without date (continuation of same date)
-                    current_debt_equity = cell_texts[0]
-                    inv_route = cell_texts[1] if len(cell_texts) > 1 else ""
-                    
-                    if inv_route in ("Sub-total", "Total", ""):
-                        continue
-                    
-                    if len(cell_texts) >= 6 and current_date:
-                        row_data = {
-                            "reporting_date": current_date,
-                            "debt_equity": current_debt_equity,
-                            "investment_route": inv_route,
-                            "gross_purchases_rs_crore": cell_texts[2],
-                            "gross_sales_rs_crore": cell_texts[3],
-                            "net_investment_rs_crore": cell_texts[4],
-                            "net_investment_usd_million": cell_texts[5],
-                        }
-                        rows.append(row_data)
-                        daily_rows_found += 1
-                        
-                elif len(cell_texts) >= 5 and current_date and current_debt_equity:
-                    # Data row inheriting date and debt/equity from above
-                    inv_route = cell_texts[0]
-                    
-                    if inv_route in ("Sub-total", "Total", ""):
-                        continue
-                    
-                    row_data = {
-                        "reporting_date": current_date,
-                        "debt_equity": current_debt_equity,
-                        "investment_route": inv_route,
-                        "gross_purchases_rs_crore": cell_texts[1],
-                        "gross_sales_rs_crore": cell_texts[2],
-                        "net_investment_rs_crore": cell_texts[3],
-                        "net_investment_usd_million": cell_texts[4],
-                    }
-                    rows.append(row_data)
-                    daily_rows_found += 1
-                
-            except StaleElementReferenceException:
+    # Find the "Total for Month" row
+    total_cells = driver.find_elements(By.XPATH, f"//td[contains(text(),'Total for {month_name}')]")
+    
+    if not total_cells:
+        log(f"  Could not find 'Total for {month_name}' row", "ERROR")
+        return None
+    
+    # Use the LAST occurrence (monthly summary, not daily table)
+    total_cell = total_cells[-1]
+    total_row = total_cell.find_element(By.XPATH, "./ancestor::tr")
+    
+    log(f"  Found 'Total for {month_name}' (using occurrence #{len(total_cells)})", "SUCCESS")
+    
+    # Collect rows BEFORE the total row (the data rows)
+    all_rows = []
+    current_row = total_row
+    
+    while True:
+        try:
+            prev_row = current_row.find_element(By.XPATH, "preceding-sibling::tr[1]")
+            row_text = prev_row.text.strip()
+            
+            # Stop if we hit the header or another month's total
+            if "Daily Trends" in row_text:
+                break
+            if "Total for" in row_text and month_name not in row_text:
+                break
+            
+            # Stop if we hit a daily date row
+            cells = prev_row.find_elements(By.TAG_NAME, "td")
+            if cells:
+                first_text = cells[0].text.strip()
+                if re.match(r'^\d{2}-[A-Za-z]{3}-\d{4}$', first_text):
+                    break
+            
+            all_rows.insert(0, prev_row)
+            current_row = prev_row
+        except:
+            break
+    
+    log(f"  Found {len(all_rows)} data rows in monthly block", "INFO")
+    
+    # Parse rows and build combinations
+    row_data = {}
+    current_de = None
+    combo_count = 0
+    
+    for row in all_rows:
+        try:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if not cells:
                 continue
-            except Exception as e:
+            
+            cell_texts = [c.text.strip() for c in cells]
+            
+            # Skip empty rows
+            if all(t == "" for t in cell_texts):
                 continue
+            
+            # Skip Sub-total and Total rows
+            if cell_texts[0] in ("Sub-total", "Total"):
+                continue
+            
+            # Check if this is a Debt/Equity header row (has rowspan)
+            rowspan = cells[0].get_attribute("rowspan")
+            rowspan_int = int(rowspan) if rowspan and rowspan.isdigit() else 0
+            
+            if rowspan_int > 1 and len(cell_texts) >= 6:
+                # This is a category header: Debt/Equity + Investment Route + 4 metrics
+                current_de = cell_texts[0]
+                inv_route = cell_texts[1]
+                
+                if inv_route in ("Sub-total", "Total", ""):
+                    continue
+                
+                metrics = cell_texts[2:6]  # GP, GS, NI, USD
+                
+            elif rowspan_int > 1 and len(cell_texts) >= 2:
+                # Category header where Investment Route is in cell[1] and metrics start at cell[2]
+                current_de = cell_texts[0]
+                inv_route = cell_texts[1]
+                
+                if inv_route in ("Sub-total", "Total", ""):
+                    continue
+                
+                if len(cell_texts) >= 6:
+                    metrics = cell_texts[2:6]
+                else:
+                    continue
+                
+            elif current_de and len(cell_texts) >= 5:
+                # Data row inheriting Debt/Equity
+                inv_route = cell_texts[0]
+                
+                if inv_route in ("Sub-total", "Total", ""):
+                    continue
+                
+                metrics = cell_texts[1:5]
+                
+            else:
+                continue
+            
+            # Build column names for each metric
+            metric_names = [
+                "Gross_Purchases_Rs_Crore",
+                "Gross_Sales_Rs_Crore",
+                "Net_Investment_Rs_Crore",
+                "Net_Investment_USD_million"
+            ]
+            
+            for metric_name, val in zip(metric_names, metrics):
+                col_name = sanitize_column_name(f"{current_de}_{inv_route}_{metric_name}")
+                row_data[col_name] = val
+                combo_count += 1
         
-        log(f"  Extracted {daily_rows_found} daily data rows", "SUCCESS")
-        
-        # Debug: Show first few rows
-        if daily_rows_found > 0:
-            log(f"  Sample rows:", "INFO")
-            for row in rows[:3]:
-                log(f"    {row['reporting_date']} | {row['debt_equity']} | {row['investment_route']} | GP:{row['gross_purchases_rs_crore']}", "INFO")
-        
-        return rows
-        
-    except Exception as e:
-        log(f"  Extraction error: {e}", "ERROR")
-        traceback.print_exc()
-        return rows
+        except StaleElementReferenceException:
+            continue
+        except Exception as e:
+            continue
+    
+    log(f"  Created {combo_count} metric columns from {combo_count//4} combinations", "SUCCESS")
+    
+    return row_data
 
 # ========================
 #  MAIN SCRAPING LOOP
@@ -427,41 +420,38 @@ def scrape_all_months():
     start_time_global = datetime.now()
     
     driver = None
-    total_days_processed = 0
-    total_rows_inserted = 0
-    failed_dates = []
+    total_processed = 0
+    failed_months = []
     
     log("=" * 60, "STAGE")
-    log("FPI ARCHIVE SCRAPER - DAILY EXTRACTION MODE", "STAGE")
+    log("FPI ARCHIVE SCRAPER - MONTHLY WIDE FORMAT", "STAGE")
     log("=" * 60, "STAGE")
     log(f"Year range: {START_YEAR} - {END_YEAR}", "INFO")
-    log(f"Date mode: {'Last day of month' if USE_MONTH_LAST_DAY else 'First day of month'}", "INFO")
+    log(f"Date mode: {'Last day of month (full month)' if USE_MONTH_LAST_DAY else 'First day of month'}", "INFO")
     
     # Initialize database
     init_db()
     
-    # Generate list of dates to scrape
-    dates_to_scrape = []
+    # Generate months list
+    months_to_scrape = []
     for year in range(START_YEAR, END_YEAR + 1):
         for month in range(1, 13):
             if USE_MONTH_LAST_DAY:
                 day = calendar.monthrange(year, month)[1]
             else:
                 day = 1
-            dates_to_scrape.append((day, month, year))
+            months_to_scrape.append((year, month, day))
     
     # Apply chunking
     if END_INDEX:
-        dates_to_scrape = dates_to_scrape[START_INDEX:END_INDEX]
+        months_to_scrape = months_to_scrape[START_INDEX:END_INDEX]
     elif START_INDEX > 0:
-        dates_to_scrape = dates_to_scrape[START_INDEX:]
+        months_to_scrape = months_to_scrape[START_INDEX:]
     
-    total_dates = len(dates_to_scrape)
-    log(f"Total dates to scrape: {total_dates}", "INFO")
-    log(f"Estimated time: {total_dates * 20 // 60}-{total_dates * 25 // 60} minutes", "INFO")
+    total_months = len(months_to_scrape)
+    log(f"Total months to scrape: {total_months}", "INFO")
     
     try:
-        # Build browser
         driver = build_driver()
         load_url_with_retry(driver, URL)
         
@@ -470,12 +460,10 @@ def scrape_all_months():
         )
         log("Page ready. Starting scraping...\n", "SUCCESS")
         
-        # Main scraping loop
-        for idx, (day, month, year) in enumerate(dates_to_scrape, 1):
+        for idx, (year, month, day) in enumerate(months_to_scrape, 1):
             month_name = calendar.month_name[month]
-            date_str = f"{day:02d}-{calendar.month_abbr[month]}-{year}"
             
-            log_progress(idx, total_dates, f"{date_str}")
+            log_progress(idx, total_months, f"{month_name} {year}")
             
             success = False
             
@@ -489,62 +477,55 @@ def scrape_all_months():
                     
                     # Set date
                     if not set_date(driver, day, month, year):
+                        log(f"  Date set failed (attempt {attempt}/3)", "WARNING")
                         if attempt < 3:
                             load_url_with_retry(driver, URL)
                             continue
                     
                     # Click view report
                     if not click_view_report(driver):
+                        log(f"  View Report failed (attempt {attempt}/3)", "WARNING")
                         if attempt < 3:
                             load_url_with_retry(driver, URL)
                             continue
                     
-                    # Additional wait for data to render
                     time.sleep(2)
                     
-                    # Extract daily rows
-                    daily_rows = extract_all_daily_rows(driver)
+                    # Extract monthly totals
+                    monthly_data = extract_monthly_totals(driver, month_name)
                     
-                    if daily_rows:
-                        insert_daily_rows(daily_rows)
-                        total_days_processed += 1
-                        total_rows_inserted += len(daily_rows)
-                        log(f"  ✅ Inserted {len(daily_rows)} rows for {date_str}", "SUCCESS")
+                    if monthly_data and len(monthly_data) > 0:
+                        # Build row
+                        row_data = {
+                            "reporting_date": f"{year}-{month:02d}-{day:02d}"
+                        }
+                        row_data.update(monthly_data)
+                        
+                        upsert_monthly_row(row_data)
+                        total_processed += 1
+                        log(f"  ✅ Inserted {len(monthly_data)} metrics for {month_name} {year}", "SUCCESS")
                         print()
                         success = True
                         break
                     else:
-                        log(f"  No rows extracted for {date_str} (attempt {attempt}/3)", "WARNING")
-                        if attempt == 3:
-                            failed_dates.append(date_str)
-                        else:
+                        log(f"  No data extracted (attempt {attempt}/3)", "WARNING")
+                        if attempt < 3:
                             load_url_with_retry(driver, URL)
-                
-                except ConnectionError as e:
-                    log(f"  Connection error: {e}", "ERROR")
-                    if attempt < 3:
-                        try:
-                            driver = restart_browser(driver)
-                        except:
-                            pass
-                    if attempt == 3:
-                        failed_dates.append(date_str)
                 
                 except Exception as e:
-                    log(f"  Error: {e}", "ERROR")
+                    log(f"  Error (attempt {attempt}/3): {e}", "ERROR")
                     if attempt < 3:
                         try:
                             load_url_with_retry(driver, URL)
                         except:
                             driver = restart_browser(driver)
-                    if attempt == 3:
-                        failed_dates.append(date_str)
+                
+                if attempt == 3:
+                    failed_months.append(f"{month_name} {year}")
         
-        # Retry failed dates
-        if failed_dates:
-            log(f"\n{'='*60}", "STAGE")
-            log(f"RETRYING {len(failed_dates)} FAILED DATES", "STAGE")
-            log(f"{'='*60}", "STAGE")
+        # Retry failed months
+        if failed_months:
+            log(f"\nRetrying {len(failed_months)} failed months...", "STAGE")
             
             try:
                 driver = restart_browser(driver)
@@ -553,36 +534,36 @@ def scrape_all_months():
                 load_url_with_retry(driver, URL)
             
             still_failed = []
-            for date_str in failed_dates:
-                log(f"Retrying: {date_str}", "STAGE")
+            for fail_str in failed_months:
+                log(f"Retrying: {fail_str}", "STAGE")
                 
-                # Parse date
-                parts = date_str.split("-")
-                day = int(parts[0])
-                month = list(calendar.month_abbr).index(parts[1])
-                year = int(parts[2])
+                parts = fail_str.split()
+                month_name = parts[0]
+                year = int(parts[1])
+                month = list(calendar.month_name).index(month_name)
+                day = calendar.monthrange(year, month)[1] if USE_MONTH_LAST_DAY else 1
                 
                 try:
                     set_date(driver, day, month, year)
                     click_view_report(driver)
                     time.sleep(2)
                     
-                    daily_rows = extract_all_daily_rows(driver)
+                    monthly_data = extract_monthly_totals(driver, month_name)
                     
-                    if daily_rows:
-                        insert_daily_rows(daily_rows)
-                        total_days_processed += 1
-                        total_rows_inserted += len(daily_rows)
-                        log(f"  ✅ Retry successful: {len(daily_rows)} rows", "SUCCESS")
+                    if monthly_data and len(monthly_data) > 0:
+                        row_data = {"reporting_date": f"{year}-{month:02d}-{day:02d}"}
+                        row_data.update(monthly_data)
+                        upsert_monthly_row(row_data)
+                        total_processed += 1
+                        log(f"  ✅ Retry successful", "SUCCESS")
                     else:
-                        still_failed.append(date_str)
-                        log(f"  ❌ Retry failed", "ERROR")
+                        still_failed.append(fail_str)
                         
                 except Exception as e:
-                    still_failed.append(date_str)
-                    log(f"  ❌ Retry error: {e}", "ERROR")
+                    still_failed.append(fail_str)
+                    log(f"  ❌ Retry failed: {e}", "ERROR")
             
-            failed_dates = still_failed
+            failed_months = still_failed
     
     except Exception as e:
         log(f"FATAL ERROR: {e}", "ERROR")
@@ -595,30 +576,27 @@ def scrape_all_months():
             except:
                 pass
         
-        # Final report
         total_elapsed = (datetime.now() - start_time_global).total_seconds()
         
         log("\n" + "=" * 60, "STAGE")
         log("SCRAPING COMPLETE", "STAGE")
         log("=" * 60, "STAGE")
         log(f"Total time: {timedelta(seconds=int(total_elapsed))}", "INFO")
-        log(f"Dates processed: {total_days_processed}/{total_dates}", "INFO" if total_days_processed == total_dates else "WARNING")
-        log(f"Total rows inserted: {total_rows_inserted}", "INFO")
+        log(f"Months processed: {total_processed}/{total_months}", "SUCCESS" if total_processed == total_months else "WARNING")
         
-        if failed_dates:
-            log(f"Failed dates ({len(failed_dates)}):", "ERROR")
-            for d in failed_dates:
-                log(f"  - {d}", "ERROR")
+        if failed_months:
+            log(f"Failed ({len(failed_months)}): {failed_months}", "ERROR")
         else:
-            log("ALL DATES SCRAPED SUCCESSFULLY!", "SUCCESS")
+            log("ALL MONTHS SUCCESSFULLY SCRAPED!", "SUCCESS")
         
-        # Database stats
+        # Database info
+        columns = get_existing_columns()
         with get_connection() as con:
-            count = con.execute("SELECT COUNT(*) FROM fpi_daily_data").fetchone()[0]
-            dates = con.execute("SELECT COUNT(DISTINCT reporting_date) FROM fpi_daily_data").fetchone()[0]
-            log(f"\nDatabase: {DB_FILE}", "INFO")
-            log(f"Total rows: {count}", "INFO")
-            log(f"Unique dates: {dates}", "INFO")
+            count = con.execute("SELECT COUNT(*) FROM fpi_monthly_data").fetchone()[0]
+        
+        log(f"\nDatabase: {DB_FILE}", "INFO")
+        log(f"Rows (months): {count}", "INFO")
+        log(f"Columns: {len(columns)} (1 date + {len(columns)-1} metrics)", "INFO")
         
         print()
 
