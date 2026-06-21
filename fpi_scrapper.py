@@ -430,19 +430,42 @@ def wait_and_extract_data(driver, month_name, max_wait=120):
     raise TableNotFoundError(f"Could not find 'Total for {month_name}' row within {max_wait}s")
 
 def _extract_monthly_data(driver, total_cell, month_name):
+    """Extract all combination data starting from the total row."""
     try:
         total_row = total_cell.find_element(By.XPATH, "./ancestor::tr")
         
+        # Get ALL rows before the total row (the total row's data rows come BEFORE it in the HTML)
         all_rows = []
         current_row = total_row
         
-        while current_row and len(all_rows) < 20:
-            all_rows.append(current_row)
+        # Collect ALL preceding sibling rows until we hit another total or run out
+        safety_counter = 0
+        while safety_counter < 30:
             try:
-                next_row = current_row.find_element(By.XPATH, "following-sibling::tr[1]")
-                current_row = next_row
+                prev_row = current_row.find_element(By.XPATH, "preceding-sibling::tr[1]")
+                row_class = prev_row.get_attribute("class") or ""
+                row_text = prev_row.text.strip()
+                
+                # Stop if we hit another "Total for" row or header
+                if "Total for" in row_text and month_name not in row_text:
+                    break
+                
+                all_rows.insert(0, prev_row)  # Insert at beginning to maintain order
+                current_row = prev_row
+                safety_counter += 1
             except:
                 break
+        
+        log(f"  Found {len(all_rows)} rows preceding 'Total for {month_name}'", "INFO")
+        
+        # Debug: Print first few rows to understand structure
+        for i, row in enumerate(all_rows[:3]):
+            try:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                cell_texts = [c.text.strip() for c in cells]
+                log(f"  Row {i}: {cell_texts}", "INFO")
+            except:
+                pass
         
         data = {}
         current_d_e = None
@@ -456,48 +479,76 @@ def _extract_monthly_data(driver, total_cell, month_name):
                 
                 cell_texts = [c.text.strip() for c in cells]
                 
-                if len(cell_texts) >= 2 and cell_texts[0] in ("Equity", "Debt"):
-                    current_d_e = cell_texts[0]
-                    inv_route = cell_texts[1]
-                    
-                    if inv_route in ("Sub-total", "Total", ""):
-                        continue
-                    
-                    if len(cell_texts) >= 6:
-                        metrics = cell_texts[2:6]
-                        for metric_name, val in zip(METRIC_COLS, metrics):
-                            col_name = sanitize_column_name(
-                                f"{current_d_e}_{inv_route}_{metric_name}"
-                            )
-                            data[col_name] = val
-                        row_count += 1
+                # Skip empty rows
+                if all(t == "" for t in cell_texts):
+                    continue
                 
-                elif len(cell_texts) >= 1 and current_d_e:
+                # Skip "Sub-total" rows
+                if "Sub-total" in cell_texts:
+                    continue
+                
+                # Detect Debt/Equity row (has rowspan attribute)
+                if len(cells) >= 2:
+                    first_cell_text = cell_texts[0]
+                    rowspan = cells[0].get_attribute("rowspan")
+                    
+                    if first_cell_text in ("Equity", "Debt") and rowspan:
+                        current_d_e = first_cell_text
+                        inv_route = cell_texts[1]
+                        
+                        if inv_route in ("Sub-total", "Total", ""):
+                            continue
+                        
+                        if len(cell_texts) >= 6:
+                            metrics = cell_texts[2:6]
+                            for metric_name, val in zip(METRIC_COLS, metrics):
+                                col_name = sanitize_column_name(
+                                    f"{current_d_e}_{inv_route}_{metric_name}"
+                                )
+                                data[col_name] = val
+                            row_count += 1
+                            continue
+                
+                # Regular data row (inherits Debt/Equity from previous row)
+                if len(cell_texts) >= 5 and current_d_e:
                     inv_route = cell_texts[0]
                     
                     if inv_route in ("Sub-total", "Total", ""):
                         continue
                     
-                    if len(cell_texts) >= 5:
-                        metrics = cell_texts[1:5]
-                        for metric_name, val in zip(METRIC_COLS, metrics):
-                            col_name = sanitize_column_name(
-                                f"{current_d_e}_{inv_route}_{metric_name}"
-                            )
-                            data[col_name] = val
-                        row_count += 1
+                    metrics = cell_texts[1:5]
+                    for metric_name, val in zip(METRIC_COLS, metrics):
+                        col_name = sanitize_column_name(
+                            f"{current_d_e}_{inv_route}_{metric_name}"
+                        )
+                        data[col_name] = val
+                    row_count += 1
                             
             except StaleElementReferenceException:
                 continue
-            except:
+            except Exception as e:
+                log(f"  Error parsing row: {e}", "WARNING")
                 continue
         
-        log(f"  Parsed {row_count} combination rows", "INFO")
+        if row_count == 0:
+            # Debug: Print all rows we found
+            log(f"  WARNING: No combinations extracted. Dumping {len(all_rows)} rows:", "WARNING")
+            for i, row in enumerate(all_rows):
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    cell_texts = [c.text.strip()[:50] for c in cells]  # Truncate long text
+                    rowspan_info = [c.get_attribute("rowspan") for c in cells]
+                    log(f"  Row {i}: texts={cell_texts} | rowspans={rowspan_info}", "INFO")
+                except:
+                    pass
+        
         return data
         
     except Exception as e:
+        log(f"  Data extraction error: {e}", "ERROR")
+        traceback.print_exc()
         raise DataExtractionError(f"Data extraction failed: {e}")
-
+    
 # ========================
 #  MAIN SCRAPING LOOP
 # ========================
