@@ -264,7 +264,7 @@ def click_view_report(driver):
 def extract_all_days_from_month(driver, month_name, year):
     """
     Select the last day of the month, then extract ALL trading days
-    visible in the table. Returns a list of dicts, one per trading day.
+    visible in the table. Handles both old and new table formats.
     """
     all_daily_rows = []
     
@@ -278,7 +278,20 @@ def extract_all_days_from_month(driver, month_name, year):
         table = tables[0]
         tr_elements = table.find_elements(By.TAG_NAME, "tr")
         
-        log(f"  Scanning {len(tr_elements)} table rows...", "INFO")
+        # First, detect table format by checking header row
+        has_investment_route = False
+        for tr in tr_elements[:5]:  # Check first few rows
+            cells = tr.find_elements(By.TAG_NAME, "th")
+            if cells:
+                header_texts = [c.text.strip() for c in cells]
+                if "Investment Route" in " ".join(header_texts):
+                    has_investment_route = True
+                    break
+        
+        if has_investment_route:
+            log(f"  Detected MODERN table format (with Investment Route column)", "INFO")
+        else:
+            log(f"  Detected OLD table format (no Investment Route column)", "INFO")
         
         current_date = None
         current_debt_equity = None
@@ -307,12 +320,12 @@ def extract_all_days_from_month(driver, month_name, year):
                     continue
                 if "Total for" in " ".join(cell_texts):
                     continue
-                if "Total for 20" in " ".join(cell_texts):  # Yearly total
+                if "Grand Total" in " ".join(cell_texts):
                     continue
                 
                 # Check for date row
                 if re.match(date_pattern, cell_texts[0]):
-                    # Save previous date's data if exists
+                    # Save previous date's data
                     if current_date and current_row_data:
                         current_row_data["reporting_date"] = current_date
                         all_daily_rows.append(current_row_data)
@@ -322,28 +335,49 @@ def extract_all_days_from_month(driver, month_name, year):
                     current_date = cell_texts[0]
                     current_row_data = {}
                     
-                    # Parse first row of this date
-                    if len(cell_texts) >= 3:
-                        if cell_texts[1] in ("Equity", "Debt", "Debt-General Limit", "Debt-VRR", 
-                                               "Debt-FAR", "Hybrid", "Mutual Funds", "AIFs"):
-                            current_debt_equity = cell_texts[1]
-                            inv_route = cell_texts[2] if len(cell_texts) > 2 else ""
-                        else:
-                            inv_route = cell_texts[1]
-                        
-                        if inv_route not in ("Sub-total", "Total", "") and len(cell_texts) >= 7:
-                            metrics = cell_texts[3:7]
-                            metric_suffixes = [
-                                "Gross_Purchases_Rs_Crore",
-                                "Gross_Sales_Rs_Crore",
-                                "Net_Investment_Rs_Crore",
-                                "Net_Investment_USD_million"
-                            ]
-                            for suffix, val in zip(metric_suffixes, metrics):
-                                col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
-                                current_row_data[col_name] = val
+                    if has_investment_route:
+                        # MODERN FORMAT: Date | Debt/Equity | Investment Route | GP | GS | NI | USD
+                        if len(cell_texts) >= 3:
+                            # Check if cell[1] is a Debt/Equity category
+                            if cell_texts[1] in ("Equity", "Debt", "Debt-General Limit", 
+                                                   "Debt-VRR", "Debt-FAR", "Hybrid", 
+                                                   "Mutual Funds", "AIFs"):
+                                current_debt_equity = cell_texts[1]
+                                inv_route = cell_texts[2] if len(cell_texts) > 2 else ""
+                            else:
+                                inv_route = cell_texts[1]
+                            
+                            if inv_route not in ("Sub-total", "Total", "") and len(cell_texts) >= 7:
+                                metrics = cell_texts[3:7]
+                                metric_suffixes = [
+                                    "Gross_Purchases_Rs_Crore",
+                                    "Gross_Sales_Rs_Crore",
+                                    "Net_Investment_Rs_Crore",
+                                    "Net_Investment_USD_million"
+                                ]
+                                for suffix, val in zip(metric_suffixes, metrics):
+                                    col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
+                                    current_row_data[col_name] = val
                     
-                elif len(cell_texts) >= 2 and cell_texts[0] in (
+                    else:
+                        # OLD FORMAT: Date | Debt/Equity | GP | GS | NI | USD
+                        if len(cell_texts) >= 2:
+                            if cell_texts[1] in ("Equity", "Debt"):
+                                current_debt_equity = cell_texts[1]
+                                
+                                if len(cell_texts) >= 6:
+                                    metrics = cell_texts[2:6]
+                                    metric_suffixes = [
+                                        "Gross_Purchases_Rs_Crore",
+                                        "Gross_Sales_Rs_Crore",
+                                        "Net_Investment_Rs_Crore",
+                                        "Net_Investment_USD_million"
+                                    ]
+                                    for suffix, val in zip(metric_suffixes, metrics):
+                                        col_name = sanitize_column_name(f"{current_debt_equity}_Total_{suffix}")
+                                        current_row_data[col_name] = val
+                    
+                elif has_investment_route and len(cell_texts) >= 2 and cell_texts[0] in (
                     "Equity", "Debt", "Debt-General Limit", "Debt-VRR", 
                     "Debt-FAR", "Hybrid", "Mutual Funds", "AIFs"
                 ):
@@ -362,7 +396,7 @@ def extract_all_days_from_month(driver, month_name, year):
                             col_name = sanitize_column_name(f"{current_debt_equity}_{inv_route}_{suffix}")
                             current_row_data[col_name] = val
                         
-                elif len(cell_texts) >= 5 and current_debt_equity:
+                elif has_investment_route and len(cell_texts) >= 5 and current_debt_equity:
                     inv_route = cell_texts[0]
                     
                     if inv_route not in ("Sub-total", "Total", ""):
@@ -400,7 +434,7 @@ def extract_all_days_from_month(driver, month_name, year):
         log(f"  Extraction error: {e}", "ERROR")
         traceback.print_exc()
         return all_daily_rows
-
+    
 # ========================
 #  MAIN SCRAPING LOOP
 # ========================
