@@ -20,19 +20,61 @@ on:
         default: 'True'
 
 jobs:
+  # First, calculate the number of months and create dynamic chunks
+  calculate-chunks:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.chunks.outputs.matrix }}
+    steps:
+      - name: Calculate chunk matrix
+        id: chunks
+        run: |
+          START_YEAR=${{ github.event.inputs.start_year || '2012' }}
+          END_YEAR=${{ github.event.inputs.end_year || '2025' }}
+          
+          # Calculate total months
+          TOTAL_MONTHS=$(( (END_YEAR - START_YEAR + 1) * 12 ))
+          
+          # Determine optimal number of chunks (max 4, min 1)
+          if [ $TOTAL_MONTHS -le 12 ]; then
+            CHUNKS=1
+          elif [ $TOTAL_MONTHS -le 48 ]; then
+            CHUNKS=2
+          elif [ $TOTAL_MONTHS -le 96 ]; then
+            CHUNKS=3
+          else
+            CHUNKS=4
+          fi
+          
+          CHUNK_SIZE=$(( TOTAL_MONTHS / CHUNKS ))
+          
+          # Generate matrix JSON
+          echo "Total months: $TOTAL_MONTHS"
+          echo "Chunks: $CHUNKS"
+          echo "Chunk size: $CHUNK_SIZE"
+          
+          MATRIX="{\"include\":["
+          for i in $(seq 0 $((CHUNKS - 1))); do
+            START=$(( i * CHUNK_SIZE ))
+            if [ $i -eq $((CHUNKS - 1)) ]; then
+              END=$TOTAL_MONTHS
+            else
+              END=$(( (i + 1) * CHUNK_SIZE ))
+            fi
+            if [ $i -gt 0 ]; then
+              MATRIX+=","
+            fi
+            MATRIX+="{\"start\":$START,\"end\":$END}"
+          done
+          MATRIX+="]}"
+          
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
   scrape:
+    needs: calculate-chunks
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - start: 0
-            end: 42
-          - start: 42
-            end: 84
-          - start: 84
-            end: 126
-          - start: 126
-            end: 168
+      matrix: ${{ fromJson(needs.calculate-chunks.outputs.chunks) }}
 
     runs-on: ubuntu-latest
 
@@ -61,14 +103,11 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
-          START_YEAR: ${{ github.event.inputs.start_year || '2012' }}
-          END_YEAR: ${{ github.event.inputs.end_year || '2025' }}
-          USE_LAST_DAY: ${{ github.event.inputs.use_last_day || 'True' }}
         run: |
           python fpi_scrapper.py \
-            --start-year $START_YEAR \
-            --end-year $END_YEAR \
-            --use-last-day $USE_LAST_DAY \
+            --start-year ${{ github.event.inputs.start_year || '2012' }} \
+            --end-year ${{ github.event.inputs.end_year || '2025' }} \
+            --use-last-day ${{ github.event.inputs.use_last_day || 'True' }} \
             --start ${{ matrix.start }} \
             --end ${{ matrix.end }}
 
