@@ -3,6 +3,7 @@ import time
 import calendar
 import argparse
 import traceback
+import random
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -62,17 +63,31 @@ class BrowserCrashError(ScraperError):
     """Raised when the browser crashes and restart fails."""
     pass
 
+class ConnectionError(ScraperError):
+    """Raised when connection to the website fails."""
+    pass
+
 # ========================
 #  WEBDRIVER MANAGEMENT
 # ========================
 def build_driver():
     """Create a fresh Chrome driver with robust options."""
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")  # newer headless mode
+    
+    # Headless mode
+    options.add_argument("--headless=new")
+    
+    # Security/SSL options for problematic sites
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors")
+    options.add_argument("--disable-web-security")
+    options.add_argument("--allow-running-insecure-content")
+    
+    # Performance options
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-sync")
     options.add_argument("--disable-translate")
@@ -82,19 +97,53 @@ def build_driver():
     options.add_argument("--safebrowsing-disable-auto-update")
     options.add_argument("--start-maximized")
     options.add_argument("--incognito")
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--ignore-ssl-errors")
-    options.add_argument("--disable-web-security")
-    options.add_argument("--allow-running-insecure-content")
+    
+    # Additional options to avoid detection and connection issues
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-features=NetworkService,NetworkServiceInProcess")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+    options.add_argument("--dns-prefetch-disable")
+    options.add_argument("--disable-client-side-phishing-detection")
+    options.add_argument("--disable-component-update")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-domain-reliability")
+    
+    # User agent to look more like a real browser
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # Page load strategy
+    options.page_load_strategy = 'eager'  # Don't wait for all resources
     
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(60)
-        driver.set_script_timeout(60)
+        driver.set_page_load_timeout(30)  # Shorter timeout
+        driver.set_script_timeout(30)
         return driver
     except Exception as e:
         raise BrowserCrashError(f"Failed to create Chrome driver: {e}")
+
+def load_url_with_retry(driver, url, max_retries=5):
+    """Load URL with exponential backoff on connection errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            driver.get(url)
+            # Wait for page to be ready
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            time.sleep(2)
+            return True
+        except WebDriverException as e:
+            if "ERR_CONNECTION_RESET" in str(e) or "ERR_CONNECTION_CLOSED" in str(e) or "ERR_TIMED_OUT" in str(e):
+                wait_time = 2 ** attempt + random.uniform(0, 1)
+                print(f"  ⚠️ Connection error (attempt {attempt}/{max_retries}), retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                if attempt == max_retries:
+                    raise ConnectionError(f"Failed to load URL after {max_retries} attempts: {e}")
+            else:
+                raise
 
 def restart_browser(driver, max_attempts=3):
     """Restart browser with retries on failure."""
@@ -106,8 +155,8 @@ def restart_browser(driver, max_attempts=3):
                 except:
                     pass
             new_driver = build_driver()
-            new_driver.get(URL)
-            WebDriverWait(new_driver, 30).until(
+            load_url_with_retry(new_driver, URL)
+            WebDriverWait(new_driver, 20).until(
                 EC.presence_of_element_located((By.ID, "txtDate"))
             )
             return new_driver
@@ -117,7 +166,7 @@ def restart_browser(driver, max_attempts=3):
                     f"Browser restart failed after {max_attempts} attempts: {e}"
                 )
             print(f"  ⚠️ Browser restart attempt {attempt} failed, retrying...")
-            time.sleep(3)
+            time.sleep(5)
 
 # ========================
 #  DATE SELECTION - MULTI-LAYER FALLBACK
@@ -133,13 +182,13 @@ def set_date_robust(driver, day, month, year, max_retries=3):
         try:
             # Method 1: Try calendar popup
             if _set_date_via_calendar(driver, day, month, year):
-                _verify_date_set(driver, day, month, year)
-                return True
+                if _verify_date_set(driver, day, month, year):
+                    return True
             
             # Method 2: Direct hidden field injection
             if _set_date_via_hidden_fields(driver, day, month, year):
-                _verify_date_set(driver, day, month, year)
-                return True
+                if _verify_date_set(driver, day, month, year):
+                    return True
             
             raise DateSelectionError("All date selection methods failed")
             
@@ -147,9 +196,8 @@ def set_date_robust(driver, day, month, year, max_retries=3):
             errors.append(str(e))
             if attempt < max_retries:
                 print(f"  ⚠️ Date selection attempt {attempt}/{max_retries} failed: {e}")
-                # Reload page before retry
                 try:
-                    driver.get(URL)
+                    load_url_with_retry(driver, URL)
                     WebDriverWait(driver, 20).until(
                         EC.presence_of_element_located((By.ID, "txtDate"))
                     )
@@ -164,51 +212,42 @@ def set_date_robust(driver, day, month, year, max_retries=3):
 def _set_date_via_calendar(driver, day, month, year):
     """Try to set date using the calendar widget. Returns True if successful."""
     try:
-        # Click calendar icon
         cal_img = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.ID, "imgtxtDate"))
         )
         cal_img.click()
         time.sleep(1)
         
-        # Wait for calendar container
         cal = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "div[id*='Calendar'], div[id*='calendar'], .ajax__calendar_container")
             )
         )
         
-        # Navigate to correct year/month
         target_month = calendar.month_name[month]
         
-        # Read current month/year from calendar title
         title_elem = cal.find_element(
             By.CSS_SELECTOR, "div[class*='title'], div[class*='header'], .ajax__calendar_title"
         )
-        title_text = title_elem.text  # e.g., "December, 2010"
+        title_text = title_elem.text
         
-        # Parse current month/year
         parts = title_text.replace(",", "").split()
         current_month_name = parts[0]
         current_year = int(parts[-1])
         
-        # Navigate months if needed
-        max_nav = 24  # max months to navigate (2 years)
+        max_nav = 36
         nav_count = 0
         
         while (current_year != year or current_month_name != target_month) and nav_count < max_nav:
-            # Determine direction
             current_month_num = list(calendar.month_name).index(current_month_name)
             if current_month_num == 0:
                 current_month_num = 1
             
             if (year > current_year) or (year == current_year and month > current_month_num):
-                # Click next
                 next_btn = cal.find_element(
                     By.CSS_SELECTOR, "div[class*='next'], a[class*='next'], .ajax__calendar_next a"
                 )
             else:
-                # Click previous
                 next_btn = cal.find_element(
                     By.CSS_SELECTOR, "div[class*='prev'], a[class*='prev'], .ajax__calendar_prev a"
                 )
@@ -216,7 +255,6 @@ def _set_date_via_calendar(driver, day, month, year):
             next_btn.click()
             time.sleep(0.3)
             
-            # Re-read title
             title_elem = cal.find_element(
                 By.CSS_SELECTOR, "div[class*='title'], div[class*='header'], .ajax__calendar_title"
             )
@@ -230,10 +268,9 @@ def _set_date_via_calendar(driver, day, month, year):
         if nav_count >= max_nav:
             return False
         
-        # Click the day
         day_cells = cal.find_elements(
             By.CSS_SELECTOR, 
-            "td[class*='day'], td[class*='active'], td[class*='ajax__calendar_day'], td[class*='ajax__calendar_active']"
+            "td[class*='day'], td[class*='active'], .ajax__calendar_day, .ajax__calendar_active"
         )
         
         for cell in day_cells:
@@ -245,30 +282,25 @@ def _set_date_via_calendar(driver, day, month, year):
         return False
         
     except Exception as e:
-        print(f"  ℹ️ Calendar method failed: {e}")
         return False
 
 def _set_date_via_hidden_fields(driver, day, month, year):
-    """Set date by directly modifying hidden fields. Returns True if successful."""
+    """Set date by directly modifying hidden fields."""
     try:
         date_str = f"{day:02d}-{calendar.month_abbr[month]}-{year}"
         
-        # Set hidden field (this is what the server actually reads)
         driver.execute_script(f"""
             document.getElementById('hdnDate').value = '{date_str}';
             document.getElementById('txtDate').value = '{date_str}';
-            
-            // Also try to trigger any change handlers
             var event = new Event('change', {{ bubbles: true }});
             var hdnDate = document.getElementById('hdnDate');
-            hdnDate.dispatchEvent(event);
+            if (hdnDate) hdnDate.dispatchEvent(event);
         """)
         
         time.sleep(0.5)
         return True
         
-    except Exception as e:
-        print(f"  ℹ️ Hidden field method failed: {e}")
+    except Exception:
         return False
 
 def _verify_date_set(driver, day, month, year):
@@ -279,14 +311,19 @@ def _verify_date_set(driver, day, month, year):
         actual_hidden = driver.execute_script(
             "return document.getElementById('hdnDate').value;"
         )
+        
+        if expected in actual_hidden:
+            return True
+        
+        # Also check visible field
         actual_visible = driver.execute_script(
             "return document.getElementById('txtDate').value;"
         )
         
-        if expected not in actual_hidden and expected not in actual_visible:
-            print(f"  ⚠️ Date verification failed. Expected: {expected}, Got hidden: {actual_hidden}, visible: {actual_visible}")
-            return False
-        return True
+        if expected in actual_visible:
+            return True
+            
+        return False
     except:
         return False
 
@@ -294,27 +331,24 @@ def _verify_date_set(driver, day, month, year):
 #  CLICK VIEW REPORT
 # ========================
 def click_view_report_robust(driver, max_retries=3):
-    """Click View Report button with retries and validation."""
+    """Click View Report button with retries."""
     for attempt in range(1, max_retries + 1):
         try:
-            # Wait for button to be clickable
             view_btn = WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.ID, "btnSubmit1"))
             )
             
-            # Scroll into view
             driver.execute_script("arguments[0].scrollIntoView(true);", view_btn)
             time.sleep(0.3)
             
-            # Click using JavaScript (more reliable)
+            # Use JavaScript click
             driver.execute_script("arguments[0].click();", view_btn)
             
-            # Wait for page to start loading
-            time.sleep(2)
+            time.sleep(3)
             
-            # Verify page started loading (look for the table container)
+            # Wait for the table container to update
             try:
-                WebDriverWait(driver, 10).until(
+                WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located((By.ID, "dvArchiveData"))
                 )
                 return True
@@ -333,16 +367,14 @@ def click_view_report_robust(driver, max_retries=3):
 # ========================
 #  WAIT FOR AND EXTRACT DATA
 # ========================
-def wait_and_extract_data(driver, month_name, max_wait=90):
+def wait_and_extract_data(driver, month_name, max_wait=120):
     """
     Wait for the total row and extract all combination data.
-    Uses progressive polling and multiple XPath strategies.
     """
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
         try:
-            # Try multiple XPath patterns to find the total row
             xpaths = [
                 f"//td[contains(text(),'Total for {month_name}')]",
                 f"//td[contains(.,'Total for {month_name}')]",
@@ -353,76 +385,38 @@ def wait_and_extract_data(driver, month_name, max_wait=90):
                 try:
                     total_cells = driver.find_elements(By.XPATH, xpath)
                     if total_cells:
-                        # Found the total row, now extract data
                         data = _extract_monthly_data(driver, total_cells[0], month_name)
                         if data and len(data) > 0:
-                            # Validate we have the expected number of combinations
-                            expected_combos = _get_expected_combinations_from_table(driver)
-                            if expected_combos > 0 and len(data) == expected_combos * len(METRIC_COLS):
-                                return data
-                            elif len(data) > 0:
-                                return data
+                            return data
+                except StaleElementReferenceException:
+                    continue
                 except:
                     continue
             
             time.sleep(2)
             
-        except StaleElementReferenceException:
-            time.sleep(2)
-            continue
         except Exception as e:
-            print(f"  ⚠️ Polling error: {e}")
             time.sleep(2)
             continue
     
     raise TableNotFoundError(f"Could not find 'Total for {month_name}' row within {max_wait}s")
 
-def _get_expected_combinations_from_table(driver):
-    """Count how many Debt/Equity + Investment Route combinations exist."""
-    try:
-        # Look for the table and count unique combinations
-        script = """
-        var combos = new Set();
-        var rows = document.querySelectorAll('table.tbls01 tr');
-        for (var i = 0; i < rows.length; i++) {
-            var cells = rows[i].querySelectorAll('td');
-            if (cells.length >= 2) {
-                var de = cells[0].innerText.trim();
-                var route = cells[1].innerText.trim();
-                if ((de === 'Equity' || de === 'Debt') && 
-                    route !== 'Sub-total' && route !== 'Total' && route !== '') {
-                    combos.add(de + '|' + route);
-                }
-            }
-        }
-        return combos.size;
-        """
-        return driver.execute_script(script)
-    except:
-        return 0
-
 def _extract_monthly_data(driver, total_cell, month_name):
     """Extract all combination data starting from the total row."""
     try:
-        # Navigate to the parent row of the total cell
         total_row = total_cell.find_element(By.XPATH, "./ancestor::tr")
         
-        # Get all rows after the total row until we hit a new section
         all_rows = []
         current_row = total_row
         
-        while current_row:
+        while current_row and len(all_rows) < 20:
             all_rows.append(current_row)
             try:
                 next_row = current_row.find_element(By.XPATH, "following-sibling::tr[1]")
                 current_row = next_row
-                # Stop if we've collected enough rows or hit another total
-                if len(all_rows) > 20:
-                    break
             except:
                 break
         
-        # Extract combinations
         data = {}
         current_d_e = None
         
@@ -432,10 +426,8 @@ def _extract_monthly_data(driver, total_cell, month_name):
                 if not cells:
                     continue
                 
-                # Skip header row and Sub-total/Total rows
                 cell_texts = [c.text.strip() for c in cells]
                 
-                # Determine if this row has a Debt/Equity label
                 if len(cell_texts) >= 2 and cell_texts[0] in ("Equity", "Debt"):
                     current_d_e = cell_texts[0]
                     inv_route = cell_texts[1]
@@ -482,23 +474,26 @@ def scrape_all_months():
     failed_months = []
     retry_queue = []
     
+    # Generate list of months to scrape FIRST (before try block)
+    months_to_scrape = []
+    for year in range(START_YEAR, END_YEAR + 1):
+        for month in range(1, 13):
+            months_to_scrape.append((year, month))
+    
+    total_months = len(months_to_scrape)
+    
     try:
         # Initialize browser
         print("Initializing browser...")
         driver = build_driver()
-        driver.get(URL)
+        
+        print(f"Loading URL: {URL}")
+        load_url_with_retry(driver, URL)
+        
         WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.ID, "txtDate"))
         )
         print("Browser initialized successfully.\n")
-        
-        # Generate list of months to scrape
-        months_to_scrape = []
-        for year in range(START_YEAR, END_YEAR + 1):
-            for month in range(1, 13):
-                months_to_scrape.append((year, month))
-        
-        total_months = len(months_to_scrape)
         print(f"Total months to scrape: {total_months}\n")
         
         for idx, (year, month) in enumerate(months_to_scrape, 1):
@@ -514,7 +509,6 @@ def scrape_all_months():
             
             month_success = False
             
-            # Try up to 3 times with progressive recovery
             for attempt in range(1, 4):
                 try:
                     # Check if browser is responsive
@@ -547,15 +541,14 @@ def scrape_all_months():
                     month_success = True
                     break
                     
-                except (DateSelectionError, TableNotFoundError) as e:
+                except (DateSelectionError, TableNotFoundError, ConnectionError) as e:
                     print(f"  ⚠️ Attempt {attempt}/3 failed: {e}")
                     if attempt == 3:
                         print(f"  ❌ Adding to retry queue: {month_name} {year}")
                         retry_queue.append((year, month, day, month_name))
                     else:
-                        # Reload page
                         try:
-                            driver.get(URL)
+                            load_url_with_retry(driver, URL)
                             WebDriverWait(driver, 20).until(
                                 EC.presence_of_element_located((By.ID, "txtDate"))
                             )
@@ -565,7 +558,10 @@ def scrape_all_months():
                 
                 except BrowserCrashError:
                     print(f"  ⚠️ Browser crashed, restarting...")
-                    driver = restart_browser(driver)
+                    try:
+                        driver = restart_browser(driver)
+                    except:
+                        pass
                     if attempt == 3:
                         retry_queue.append((year, month, day, month_name))
                 
@@ -575,7 +571,10 @@ def scrape_all_months():
                     if attempt == 3:
                         retry_queue.append((year, month, day, month_name))
                     else:
-                        driver = restart_browser(driver)
+                        try:
+                            driver = restart_browser(driver)
+                        except:
+                            pass
         
         # Process retry queue
         if retry_queue:
@@ -583,7 +582,11 @@ def scrape_all_months():
             print(f"Processing {len(retry_queue)} failed months with fresh browser...")
             print(f"{'='*60}\n")
             
-            driver = restart_browser(driver)
+            try:
+                driver = restart_browser(driver)
+            except:
+                driver = build_driver()
+                load_url_with_retry(driver, URL)
             
             for year, month, day, month_name in retry_queue:
                 print(f"Retrying: {month_name} {year}")
@@ -606,7 +609,6 @@ def scrape_all_months():
                 except Exception as e:
                     print(f"  ❌ Retry failed: {e}")
                     failed_months.append(f"{month_name} {year}")
-                    # Still add a row with empty values for completeness
                     row_data = {"Reporting Date": f"{year}-{month:02d}-{day:02d}"}
                     all_rows.append(row_data)
     
@@ -622,12 +624,11 @@ def scrape_all_months():
             except:
                 pass
         
-        # Write CSV (even if partial)
+        # Write CSV
         if all_rows:
             print(f"\n{'='*60}")
             print(f"Writing {len(all_rows)} rows to {OUTPUT_CSV}")
             
-            # Sort rows by date
             all_rows.sort(key=lambda x: x.get("Reporting Date", ""))
             
             with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
@@ -641,7 +642,8 @@ def scrape_all_months():
         print(f"\n{'='*60}")
         print(f"SCRAPING COMPLETE")
         print(f"{'='*60}")
-        print(f"Total months processed: {len(all_rows)}/{total_months}")
+        print(f"Total months: {total_months}")
+        print(f"Rows collected: {len(all_rows)}")
         print(f"Successful: {len(all_rows) - len(failed_months)}")
         
         if failed_months:
